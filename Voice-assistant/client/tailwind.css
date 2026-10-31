@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+  /* Layout: floating nav over a two-column tablet (menu grid + docked assistant) and a tabbed ops dashboard.
+     Single deliberate light theme: the brand's cream / charcoal / gold palette in both OS themes. */
+  :root {
+    --cream: #FAF8F5; --ink: #1A1A1A; --gold: #C89547; --gold-dark: #9E7330; --line: #E7DFD3; --sand: #F2EDE5;
+    --display: "Playfair Display", Georgia, serif; --body: "Plus Jakarta Sans", system-ui, sans-serif;
+    color-scheme: light;
+  }
+  html { background: var(--cream); }
+  body {
+    background: linear-gradient(180deg, rgba(250,248,245,.34), rgba(250,248,245,.48)), url('/assets/background.avif') center / cover fixed no-repeat;
+    color: var(--ink); font-family: var(--body); font-size: 15px; -webkit-font-smoothing: antialiased;
+  }
+  body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 60; background: var(--cream); }
+  .gutter { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  @media (min-width: 640px) { .gutter { padding-left: max(24px, env(safe-area-inset-left, 0px)); padding-right: max(24px, env(safe-area-inset-right, 0px)); } }
+  h1, h2, h3 { text-wrap: balance; }
+  .tabular-nums { font-variant-numeric: tabular-nums; }
+  .label { font-size: 10.5px; letter-spacing: .2em; text-transform: uppercase; color: #6E665C; font-weight: 600; }
+  button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, [role=button]:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+
+  .btn-gold { display: inline-flex; align-items: center; gap: .5rem; background: var(--gold); color: #fff; border-radius: 999px; padding: .7rem 1.3rem; font-weight: 600; font-size: 14.5px; transition: background .2s, transform .15s; box-shadow: 0 6px 18px -8px rgba(158,115,48,.7); }
+  .btn-gold:hover:not(:disabled) { background: var(--gold-dark); }
+  .btn-gold:active:not(:disabled) { transform: scale(.98); }
+  .btn-outline { display: inline-flex; align-items: center; gap: .5rem; border: 1px solid var(--ink); color: var(--ink); background: #fff; border-radius: 999px; padding: .65rem 1.2rem; font-weight: 600; font-size: 14px; transition: background .2s; }
+  .btn-outline:hover:not(:disabled) { background: var(--sand); }
+
+  .chip { display: inline-flex; align-items: center; gap: .4rem; border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: .38rem .8rem; font-size: 13px; color: var(--ink); transition: all .2s cubic-bezier(.2,.8,.2,1); }
+  .chip:hover { border-color: var(--gold); transform: translateY(-1px); }
+  .chip-on { background: var(--ink); border-color: var(--ink); color: var(--cream); }
+  .tag { font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; font-weight: 600; padding: .3rem .6rem; border-radius: 999px; }
+  .mini-tag { font-size: 11px; border: 1px solid var(--line); border-radius: 6px; padding: 0 .35rem; color: #6E665C; }
+  .mini-chip { display: inline-flex; align-items: center; gap: .3rem; font-size: 11.5px; border: 1px solid var(--line); border-radius: 6px; padding: .2rem .45rem; color: #6E665C; background: #fff; }
+  .mini-chip-on { border-color: var(--gold); background: #F7EEDF; color: var(--ink); }
+  .cell { width: 100%; background: transparent; border: 1px solid transparent; border-radius: 6px; padding: .2rem .35rem; }
+  .cell:hover, .cell:focus { border-color: var(--line); background: #fff; outline: none; }
+  .phrase { text-align: left; font-size: 12px; border: 1px solid var(--line); background: var(--cream); border-radius: 10px; padding: .35rem .6rem; color: var(--ink); transition: all .22s cubic-bezier(.2,.8,.2,1); }
+  .phrase:hover:not(:disabled) { border-color: var(--gold); background: #F7EEDF; transform: translateY(-1px); box-shadow: 0 8px 18px -14px rgba(81,52,18,.55); }
+  .phrase:disabled { opacity: .45; cursor: not-allowed; }
+  .phrase-attack { border-style: dashed; border-color: #E6B4A8; color: #8A2E1C; background: #FDF6F4; }
+  .no-scrollbar { scrollbar-width: none; } .no-scrollbar::-webkit-scrollbar { display: none; }
+
+  /* Plate fallback, used whenever a dish photo can't load */
+  .plate-bg { background: radial-gradient(120% 90% at 30% 20%, color-mix(in srgb, var(--tone) 22%, #F6EFE4) 0%, #EFE6D8 70%); }
+  .plate { width: 62%; max-width: 170px; aspect-ratio: 1; border-radius: 50%; background: radial-gradient(circle, #fff 58%, #F3EEE6 60%, #fff 70%, #EDE6DA 100%); box-shadow: 0 14px 28px -14px rgba(60,40,10,.45), inset 0 0 0 1px rgba(0,0,0,.04); display: flex; align-items: center; justify-content: center; }
+  .plate-food { width: 52%; aspect-ratio: 1; border-radius: 46% 54% 50% 50% / 52% 46% 54% 48%; background: radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--tone) 70%, #fff) 0%, var(--tone) 55%, color-mix(in srgb, var(--tone) 70%, #000) 100%); display: flex; align-items: center; justify-content: center; box-shadow: inset 0 -6px 12px rgba(0,0,0,.18); }
+  .plate-bg { container-type: size; }
+  .plate-food span { font-size: clamp(9px, 9cqmin, 26px); }
+
+  /* Voice waveform */
+  .wave { display: inline-flex; align-items: center; gap: 3px; height: 28px; }
+  .wave-sm { height: 14px; gap: 2px; }
+  .wave i { display: block; width: 3px; height: 30%; border-radius: 2px; background: var(--gold); opacity: .55; }
+  .wave-sm i { width: 2px; }
+  .wave-idle i, .wave-standby i { animation: breathe 2.4s ease-in-out infinite; }
+  .wave-listening i { background: #E0705A; opacity: 1; animation: talk .55s ease-in-out infinite alternate; }
+  .wave-thinking i { animation: think 1s ease-in-out infinite; opacity: .9; }
+  .wave-speaking i { opacity: 1; animation: talk .42s ease-in-out infinite alternate; }
+  .wave-cooldown i { background: #E8A84C; height: 20%; animation: none; }
+  .wave-standby i { opacity: .3; }
+  @keyframes breathe { 0%,100% { height: 25%; } 50% { height: 45%; } }
+  @keyframes talk { 0% { height: 15%; } 100% { height: 100%; } }
+  @keyframes think { 0%,100% { height: 20%; opacity: .4; } 50% { height: 60%; opacity: 1; } }
+  .wave i:nth-child(3n) { animation-duration: .7s; } .wave i:nth-child(4n) { animation-duration: .5s; }
+  .mic-live::after { content: ""; position: absolute; inset: -6px; border-radius: 999px; border: 2px solid #E0705A; animation: ring 1.3s ease-out infinite; }
+  @keyframes ring { from { transform: scale(.9); opacity: .9; } to { transform: scale(1.35); opacity: 0; } }
+
+  /* Standby */
+  .standby-rings { position: absolute; left: 50%; top: 46%; translate: -50% -50%; pointer-events: none; }
+  .standby-rings span { position: absolute; left: 50%; top: 50%; translate: -50% -50%; border: 1px solid rgba(200,149,71,.22); border-radius: 50%; animation: halo 6s ease-in-out infinite; }
+  .standby-rings span:nth-child(1) { width: 380px; height: 380px; }
+  .standby-rings span:nth-child(2) { width: 560px; height: 560px; animation-delay: 1s; }
+  .standby-rings span:nth-child(3) { width: 760px; height: 760px; animation-delay: 2s; }
+  @keyframes halo { 0%,100% { opacity: .5; scale: 1; } 50% { opacity: 1; scale: 1.03; } }
+
+  .drawer { transform: translateX(105%); transition: transform .32s cubic-bezier(.2,.8,.2,1); }
+  .drawer-open { transform: none; }
+  .cart-pulse { animation: pulse .6s ease-out; }
+  @keyframes pulse { 0% { transform: scale(1); } 40% { transform: scale(1.07); box-shadow: 0 0 0 8px rgba(200,149,71,.35); } 100% { transform: scale(1); } }
+  .toast-in, .feed-in { animation: rise .3s ease-out; }
+  @keyframes rise { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; } }
+
+  /* Liquid glass: translucent, blurred surfaces with a soft inner highlight, used by both apps.
+     glass-strong is for dense text (dish cards, drawer, dialogs); glass-dark for the assistant header. */
+  .glass-bg { background: radial-gradient(1100px 600px at 10% -10%, rgba(200,149,71,.18), transparent 60%), radial-gradient(900px 560px at 100% 0%, rgba(200,149,71,.14), transparent 55%), radial-gradient(900px 600px at 40% 110%, rgba(158,115,48,.1), transparent 60%); }
+  .glass, .glass-soft, .glass-nav, .glass-strong, .glass-dark { -webkit-backdrop-filter: blur(20px) saturate(180%); backdrop-filter: blur(20px) saturate(180%); }
+  /* Zero specificity, so Tailwind's fixed/sticky/absolute still win on drawers and floating buttons. */
+  :where(.glass, .glass-soft, .glass-nav, .glass-strong, .glass-dark) { position: relative; }
+  .glass { background: rgba(255,255,255,.55); border: 1px solid rgba(255,255,255,.7); transition: transform .24s ease, box-shadow .24s ease, border-color .24s ease, background .24s ease, opacity .24s ease; }
+  .glass-soft { background: rgba(242,237,229,.55); border: 1px solid rgba(255,255,255,.5); transition: transform .24s ease, box-shadow .24s ease, border-color .24s ease, background .24s ease, opacity .24s ease; }
+  .glass-nav { background: rgba(255,255,255,.68); border: 1px solid rgba(255,255,255,.75); transition: transform .24s ease, box-shadow .24s ease, border-color .24s ease, background .24s ease, opacity .24s ease; }
+  .glass-strong { background: rgba(255,255,255,.74); border: 1px solid rgba(255,255,255,.8); transition: transform .24s ease, box-shadow .24s ease, border-color .24s ease, background .24s ease, opacity .24s ease; }
+  .glass-dark { background: rgba(26,26,26,.78); border-color: rgba(255,255,255,.12); transition: transform .24s ease, box-shadow .24s ease, border-color .24s ease, background .24s ease, opacity .24s ease; }
+  .glass:hover, .glass-soft:hover, .glass-nav:hover, .glass-strong:hover, .glass-dark:hover { transform: translateY(-1px); box-shadow: 0 12px 26px -18px rgba(60,40,10,0.45); }
+  .glass::after, .glass-soft::after, .glass-nav::after, .glass-strong::after { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 1px 0 rgba(255,255,255,.85), inset 0 0 0 1px rgba(255,255,255,.3), 0 10px 30px -16px rgba(60,40,10,.3); pointer-events: none; }
+  .glass-dark::after { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 1px 0 rgba(255,255,255,.14); pointer-events: none; }
+  .glass-chip { background: rgba(255,255,255,.6); border-color: rgba(255,255,255,.75); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .glass, .glass-soft, .glass-nav, .glass-strong, .glass-chip { background: #fff; } .glass-dark { background: var(--ink); } }
+
+  /* Account switcher (landing page), modelled on the Gmail account menu */
+  .acct-pop { transform-origin: top right; transition: opacity .16s ease, transform .16s ease; }
+  .acct-pop[hidden] { display: block; opacity: 0; transform: scale(.96) translateY(-4px); pointer-events: none; visibility: hidden; }
+  .acct-row[aria-checked="true"] { background: rgba(200,149,71,.12); }
+  .acct-row[aria-checked="true"] .acct-check { visibility: visible; }
+
+  /* Small text sitting straight on the background photo gets a soft light halo so it stays legible. */
+  .on-photo { text-shadow: 0 1px 1px rgba(255,255,255,.9), 0 0 10px rgba(255,255,255,.85), 0 0 22px rgba(255,255,255,.6); }

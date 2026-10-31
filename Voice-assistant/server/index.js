@@ -1,0 +1,333 @@
+// Shared backend for the two Tazte apps: the customer tablet app (customer-app/, served at /table/:n)
+// and the staff dashboard (staff-app/, served at /admin). One process, one SQLite database, with live
+// updates pushed to both over Server-Sent Events.
+import http from 'node:http';
+import { readFile, mkdir } from 'node:fs/promises';
+import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createStore } from './store.js';
+import { createAssistant } from './assistant.js';
+import { createWhisper } from './whisper.js';
+import { validateCall, CATEGORIES } from '../shared/engine.js';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+try { process.loadEnvFile(path.join(ROOT, '.env')); } catch { /* no .env file; use the real environment */ }
+const PORT = Number(process.env.PORT) || 3000;
+const DB_FILE = process.env.DB_FILE || path.join(ROOT, 'data', 'flavoria.db');
+const SESSION_TTL = 12 * 3600e3;
+
+await mkdir(path.dirname(DB_FILE), { recursive: true });
+const store = createStore(DB_FILE);
+const assistant = createAssistant(store);
+const whisper = createWhisper(ROOT);
+const transcribeStamps = new Map(); // table -> timestamps, caps GPU work per tablet
+const TRANSCRIBE_LIMIT = 12;
+const speakStamps = new Map(); // table -> timestamps for spoken replies
+const SPEAK_LIMIT = 30;
+const tableList = (count) => Array.from({ length: count }, (_, i) => 'T' + (i + 1));
+const envTableCount = Number(process.env.TABLE_COUNT);
+const savedTableCount = Number(store.setting('table_count'));
+let TABLE_COUNT = Number.isInteger(savedTableCount) && savedTableCount >= 1 && savedTableCount <= 99
+  ? savedTableCount
+  : Number.isInteger(envTableCount) && envTableCount >= 1 && envTableCount <= 99 ? envTableCount : 8;
+let TABLES = tableList(TABLE_COUNT);
+store.setting('table_count', String(TABLE_COUNT));
+
+// ---------- staff PIN ----------
+const sha = (s) => createHash('sha256').update(String(s)).digest('hex');
+const staffPin = process.env.STAFF_PIN ?? '1801';
+let pinHash = sha(staffPin);
+store.setting('staff_pin_hash', pinHash);
+if (!process.env.STAFF_PIN) {
+  console.log(`\n  Using default staff PIN: ${staffPin}  (set STAFF_PIN to choose your own)\n`);
+}
+const pinOk = (pin) => timingSafeEqual(Buffer.from(sha(pin), 'hex'), Buffer.from(pinHash, 'hex'));
+const loginAttempts = new Map(); // ip -> timestamps
+
+// ---------- live updates (SSE) ----------
+const clients = new Set();
+const tableSnapshot = (t) => ({ table: t, menu: store.menu(), cart: store.cart(t), note: store.note(t), orders: store.tableOrders(t), requests: store.requests(t), usage: assistant.usage(t), now: Date.now() });
+const adminSnapshot = () => ({
+  tables: TABLES, menu: store.menu(), orders: store.recentOrders(), requests: store.requests(), security: store.security(),
+  occupancy: store.tableStatuses(TABLES),
+  carts: Object.fromEntries(TABLES.map((t) => [t, store.cart(t).reduce((s, l) => s + l.qty, 0)])), now: Date.now(),
+});
+let pending = null;
+function broadcast() {
+  if (pending) return;
+  pending = setTimeout(() => {
+    pending = null;
+    let admin = null;
+    const perTable = new Map();
+    for (const c of clients) {
+      if (c.role === 'table' && !TABLES.includes(c.table)) {
+        c.res.end();
+        clients.delete(c);
+        continue;
+      }
+      let data;
+      if (c.role === 'table') {
+        if (!perTable.has(c.table)) perTable.set(c.table, JSON.stringify(tableSnapshot(c.table)));
+        data = perTable.get(c.table);
+      } else data = admin || (admin = JSON.stringify(adminSnapshot()));
+      c.res.write(`event: snapshot\ndata: ${data}\n\n`);
+    }
+  }, 40);
+}
+function openStream(req, res, client) {
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.write(`retry: 2000\nevent: snapshot\ndata: ${JSON.stringify(client.role === 'table' ? tableSnapshot(client.table) : adminSnapshot())}\n\n`);
+  const c = { res, ...client };
+  clients.add(c);
+  const ping = setInterval(() => res.write(': ping\n\n'), 25000);
+  req.on('close', () => { clearInterval(ping); clients.delete(c); });
+}
+setInterval(() => clients.size && broadcast(), 30000); // keeps "x min ago" labels and rate-limit counters fresh
+
+// ---------- http helpers ----------
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'same-origin',
+  'X-Frame-Options': 'DENY',
+  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' data: https://images.unsplash.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'",
+};
+const send = (res, status, body, headers = {}) => {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...SECURITY_HEADERS, ...headers });
+  res.end(JSON.stringify(body));
+};
+class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+const bad = (msg) => { throw new HttpError(400, msg); };
+
+async function readJson(req) {
+  if (!/^application\/json\b/.test(req.headers['content-type'] || '')) throw new HttpError(415, 'Send JSON.');
+  let size = 0; const chunks = [];
+  for await (const ch of req) { size += ch.length; if (size > 256 * 1024) throw new HttpError(413, 'Request too large.'); chunks.push(ch); }
+  try { return chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}; } catch { throw new HttpError(400, 'Invalid JSON.'); }
+}
+async function readAudio(req, maxBytes) {
+  if (!/^application\/octet-stream\b/.test(req.headers['content-type'] || '')) throw new HttpError(415, 'Send 16 kHz mono 16-bit PCM.');
+  let size = 0; const chunks = [];
+  for await (const ch of req) { size += ch.length; if (size > maxBytes) throw new HttpError(413, 'Recording too long.'); chunks.push(ch); }
+  if (!size || size % 2) throw new HttpError(400, 'Empty or malformed recording.');
+  return Buffer.concat(chunks);
+}
+const cookies = (req) => Object.fromEntries((req.headers.cookie || '').split(';').map((c) => c.trim().split('=')).filter((p) => p[0]).map(([k, ...v]) => [k, decodeURIComponent(v.join('='))]));
+const isStaff = (req) => { const t = cookies(req).flv_staff; return !!t && store.hasSession(sha(t)); };
+const secureCookie = (req) => (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : '');
+const sameOrigin = (req) => { try { return !req.headers.origin || new URL(req.headers.origin).host === req.headers.host; } catch { return false; } };
+
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.avif': 'image/avif',
+  '.mjs': 'text/javascript; charset=utf-8', '.wasm': 'application/wasm', '.onnx': 'application/octet-stream' };
+// The customer and staff apps each keep their own HTML + client source; only the built
+// JS/CSS bundle output and the backend below are shared between them.
+const CUSTOMER_PUBLIC = path.join(ROOT, 'customer-app', 'public');
+const STAFF_PUBLIC = path.join(ROOT, 'staff-app', 'public');
+const ASSETS = path.join(ROOT, 'public', 'assets');
+async function serveFile(res, base, rel, cache = 'no-cache') {
+  const file = path.join(base, rel);
+  if (!file.startsWith(base + path.sep)) return send(res, 404, { error: 'Not found' });
+  try {
+    const body = await readFile(file);
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': cache, ...SECURITY_HEADERS });
+    res.end(body);
+  } catch { send(res, 404, { error: 'Not found' }); }
+}
+
+// ---------- validation for staff edits ----------
+const CAT_IDS = CATEGORIES.map((c) => c.id).filter((c) => c !== 'all' && c !== 'specials');
+const MEALS = ['breakfast', 'lunch', 'dinner'];
+const str = (v, max, field) => (typeof v === 'string' && v.trim().length > 0 && v.length <= max ? v.trim() : bad(`${field} must be 1-${max} characters.`));
+const money = (v) => (typeof v === 'number' && isFinite(v) && v >= 0.5 && v <= 500 ? Math.round(v * 100) / 100 : bad('Price must be between $0.50 and $500.'));
+function itemPatch(body) {
+  const p = {};
+  if ('price' in body) p.price = money(body.price);
+  if ('available' in body) p.available = body.available === true;
+  if ('diet' in body) p.diet = ['veg', 'nonveg'].includes(body.diet) ? body.diet : bad('Diet must be veg or nonveg.');
+  for (const k of ['vegan', 'gf', 'chefSpecial']) if (k in body) p[k] = body[k] === true;
+  if ('spicy' in body) p.spicy = [0, 1, 2, 3].includes(body.spicy) ? body.spicy : bad('Spice level must be 0-3.');
+  if (!Object.keys(p).length) bad('Nothing to update.');
+  return p;
+}
+function newItem(r) {
+  return {
+    name: str(r.name, 80, 'Name'), desc: typeof r.desc === 'string' ? r.desc.slice(0, 200) : '', price: money(r.price),
+    category: CAT_IDS.includes(r.category) ? r.category : bad('Unknown category.'),
+    diet: r.diet === 'nonveg' ? 'nonveg' : 'veg', vegan: r.vegan === true && r.diet !== 'nonveg', gf: r.gf === true,
+    spicy: [0, 1, 2, 3].includes(r.spicy) ? r.spicy : 0,
+    meals: Array.isArray(r.meals) && r.meals.length && r.meals.every((m) => MEALS.includes(m)) ? [...new Set(r.meals)] : bad('Pick at least one meal time.'),
+    allergens: Array.isArray(r.allergens) ? r.allergens.filter((a) => typeof a === 'string').map((a) => a.slice(0, 30)).slice(0, 12) : [],
+  };
+}
+const fmtMoney = (n) => '$' + n.toFixed(2);
+
+// ---------- routes ----------
+async function route(req, res) {
+  const url = new URL(req.url, 'http://local');
+  const p = url.pathname;
+  const method = req.method;
+  let r;
+
+  // pages
+  if (method === 'GET' && p === '/') return serveFile(res, CUSTOMER_PUBLIC, 'index.html');
+  if (method === 'GET' && (r = p.match(/^\/table\/(\d{1,2})\/?$/))) return serveFile(res, CUSTOMER_PUBLIC, TABLES.includes('T' + Number(r[1])) ? 'table.html' : 'index.html');
+  if (method === 'GET' && (p === '/admin' || p === '/admin/')) return serveFile(res, STAFF_PUBLIC, 'admin.html');
+  // Vendored runtimes (React, ONNX wasm, the VAD model) only change on upgrade, so tablets may keep them a day.
+  if (method === 'GET' && p.startsWith('/assets/')) return serveFile(res, ASSETS, p.slice('/assets/'.length), p.startsWith('/assets/vendor/') ? 'public, max-age=86400' : 'public, max-age=300');
+  if (method === 'GET' && p === '/api/config') return send(res, 200, { tables: TABLES });
+  if (method === 'GET' && p === '/api/voice') {
+    const w = whisper.status();
+    const tts = w && w.voice ? { tts: 'piper', voice: w.voice } : { tts: 'browser' };
+    return send(res, 200, w ? { engine: 'whisper', model: w.model, device: w.device, ...tts } : { engine: 'browser', ...tts });
+  }
+
+  if (method !== 'GET' && !sameOrigin(req)) return send(res, 403, { error: 'Cross-site request refused.' });
+
+  // ----- customer (table) API -----
+  if ((r = p.match(/^\/api\/tables\/(T\d{1,2})(\/.*)?$/))) {
+    const table = r[1];
+    if (!TABLES.includes(table)) return send(res, 404, { error: 'Unknown table.' });
+    const sub = r[2] || '';
+    if (method === 'GET' && sub === '/events') return openStream(req, res, { role: 'table', table });
+    if (method === 'GET' && sub === '') return send(res, 200, tableSnapshot(table));
+    if (method === 'POST' && sub === '/transcribe') {
+      const now = Date.now();
+      const recent = (transcribeStamps.get(table) || []).filter((t) => now - t < 60000);
+      if (recent.length >= TRANSCRIBE_LIMIT) {
+        const retryAfter = Math.ceil((recent[0] + 60000 - now) / 1000);
+        return send(res, 429, { error: 'rate_limited', retryAfter }, { 'Retry-After': String(retryAfter) });
+      }
+      const pcm = await readAudio(req, 10 * 16000 * 2); // 10 s cap; the tablet stops at 8 s
+      if (!whisper.status()) return send(res, 503, { error: 'Voice transcription is offline.' });
+      recent.push(now); transcribeStamps.set(table, recent);
+      // Dish names steer Whisper toward the menu's spelling ("burrata", "arrabbiata", "tiramisu").
+      const prompt = 'Restaurant order. Menu: ' + store.menu().filter((m) => m.available).map((m) => m.name).join(', ') + '.';
+      try {
+        const out = await whisper.transcribe(pcm, prompt);
+        return send(res, 200, { text: out.text, ms: out.ms });
+      } catch (e) {
+        console.error('[whisper]', e.message);
+        return send(res, 503, { error: 'Voice transcription is offline.' });
+      }
+    }
+    const body = method === 'DELETE' ? {} : await readJson(req);
+
+    if (method === 'POST' && sub === '/cart') {
+      const v = validateCall({ tool: 'add_to_cart', args: { item_id: body.itemId, qty: body.qty, modifiers: body.mods } }, store.menu());
+      if (!v.ok || v.stripped.length) bad(v.errors[0] || 'That option is not available for this dish.');
+      if (!store.item(v.args.item_id).available) return send(res, 409, { error: 'That dish is unavailable tonight.' });
+      store.addToCart(table, v.args.item_id, v.args.qty, v.args.modifiers);
+    } else if (method === 'POST' && sub === '/occupancy') {
+      store.setTableOccupied(table, true);
+    } else if (method === 'PATCH' && (r = sub.match(/^\/cart\/([\w-]+)$/))) {
+      if (![-1, 1].includes(body.delta)) bad('delta must be 1 or -1.');
+      if (!store.changeQty(table, r[1], body.delta)) return send(res, 404, { error: 'Line not found.' });
+    } else if (method === 'DELETE' && (r = sub.match(/^\/cart\/([\w-]+)$/))) {
+      store.removeLine(table, r[1]);
+    } else if (method === 'PUT' && sub === '/note') {
+      store.setNote(table, typeof body.note === 'string' ? body.note.slice(0, 200) : '');
+    } else if (method === 'POST' && sub === '/reset') {
+      store.resetTable(table);
+    } else if (method === 'POST' && sub === '/orders') {
+      const orderId = store.placeOrder(table);
+      if (!orderId) return send(res, 409, { error: 'Your order is empty.' });
+      broadcast();
+      return send(res, 201, { orderId });
+    } else if (method === 'POST' && sub === '/requests') {
+      if (body.type === 'server') store.addRequest(table, 'server', 'Call Server button');
+      else if (body.type === 'bill') {
+        const split = Number.isInteger(body.split) && body.split >= 1 && body.split <= 12 ? body.split : bad('Split must be 1-12.');
+        const total = store.tableOrders(table).reduce((s, o) => s + o.total, 0);
+        if (!total) return send(res, 409, { error: 'Send your order to the kitchen first, then request the bill.' });
+        store.addRequest(table, 'bill', `Bill ${fmtMoney(total)}${split > 1 ? ` · split ${split} ways (${fmtMoney(total / split)} each)` : ''}`, split);
+      } else bad('Unknown request type.');
+    } else if (method === 'POST' && sub === '/speak') {
+      // Alice's Piper voice, synthesized locally by the voice service; the tablet plays the WAV.
+      const text = typeof body.text === 'string' ? body.text.trim().slice(0, 400) : '';
+      if (!text) bad('Nothing to say.');
+      const w = whisper.status();
+      if (!w || !w.voice) return send(res, 503, { error: 'The assistant voice is offline.' });
+      const now = Date.now();
+      const recent = (speakStamps.get(table) || []).filter((t) => now - t < 60000);
+      if (recent.length >= SPEAK_LIMIT) return send(res, 429, { error: 'rate_limited' });
+      recent.push(now); speakStamps.set(table, recent);
+      try {
+        const wav = await whisper.speak(text);
+        res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store', ...SECURITY_HEADERS });
+        return res.end(wav);
+      } catch (e) {
+        console.error('[piper]', e.message);
+        return send(res, 503, { error: 'The assistant voice is offline.' });
+      }
+    } else if (method === 'POST' && sub === '/assistant') {
+      const out = assistant.handle(table, typeof body.text === 'string' ? body.text.slice(0, 1000) : '');
+      broadcast();
+      return send(res, out.status, out.body, out.status === 429 ? { 'Retry-After': String(out.body.retryAfter) } : {});
+    } else return send(res, 404, { error: 'Not found' });
+    broadcast();
+    return send(res, 200, { ok: true });
+  }
+
+  // ----- staff (admin) API -----
+  if (p === '/api/admin/login' && method === 'POST') {
+    const ip = req.socket.remoteAddress;
+    const recent = (loginAttempts.get(ip) || []).filter((t) => Date.now() - t < 60000);
+    if (recent.length >= 5) return send(res, 429, { error: 'Too many attempts. Wait a minute and try again.' });
+    recent.push(Date.now()); loginAttempts.set(ip, recent);
+    const body = await readJson(req);
+    if (typeof body.pin !== 'string' || !pinOk(body.pin)) return send(res, 401, { error: 'That PIN is not correct.' });
+    loginAttempts.delete(ip);
+    const token = randomBytes(32).toString('base64url');
+    store.addSession(sha(token), SESSION_TTL);
+    return send(res, 200, { ok: true }, { 'Set-Cookie': `flv_staff=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL / 1000}${secureCookie(req)}` });
+  }
+  if (p.startsWith('/api/admin/')) {
+    if (!isStaff(req)) return send(res, 401, { error: 'Staff login required.' });
+    const sub = p.slice('/api/admin'.length);
+    if (method === 'GET' && sub === '/me') return send(res, 200, { ok: true });
+    if (method === 'GET' && sub === '/events') return openStream(req, res, { role: 'admin' });
+    if (method === 'POST' && sub === '/logout') {
+      store.dropSession(sha(cookies(req).flv_staff));
+      return send(res, 200, { ok: true }, { 'Set-Cookie': 'flv_staff=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
+    }
+    const body = method === 'GET' ? {} : await readJson(req);
+    if (method === 'PATCH' && (r = sub.match(/^\/menu\/([\w-]+)$/))) {
+      if (!store.updateItem(r[1], itemPatch(body))) return send(res, 404, { error: 'Dish not found.' });
+    } else if (method === 'POST' && sub === '/menu') {
+      if (!Array.isArray(body.items) || !body.items.length || body.items.length > 60) bad('Send 1-60 dishes.');
+      const added = store.publishItems(body.items.map(newItem));
+      broadcast();
+      return send(res, 201, { added: added.length });
+      } else if (method === 'PATCH' && sub === '/settings/table-count') {
+        if (!Number.isInteger(body.count) || body.count < 1 || body.count > 99) bad('Table count must be an integer from 1 to 99.');
+        TABLE_COUNT = body.count;
+        TABLES = tableList(TABLE_COUNT);
+        store.setting('table_count', String(TABLE_COUNT));
+        broadcast();
+        return send(res, 200, { tables: TABLES });
+    } else if (method === 'POST' && (r = sub.match(/^\/orders\/([\w-]+)\/advance$/))) {
+      if (!store.advanceOrder(r[1])) return send(res, 404, { error: 'Order not found.' });
+    } else if (method === 'POST' && (r = sub.match(/^\/requests\/([\w-]+)$/))) {
+      if (!['acknowledged', 'done'].includes(body.status)) bad('Unknown status.');
+      if (!store.setRequestStatus(r[1], body.status)) return send(res, 404, { error: 'Request not found.' });
+    } else return send(res, 404, { error: 'Not found' });
+    broadcast();
+    return send(res, 200, { ok: true });
+  }
+  return send(res, 404, { error: 'Not found' });
+}
+
+export const server = http.createServer(async (req, res) => {
+  try { await route(req, res); } catch (e) {
+    if (e instanceof HttpError) return send(res, e.status, { error: e.message });
+    console.error(e);
+    if (!res.headersSent) send(res, 500, { error: 'Something went wrong. Please try again.' });
+  }
+});
+server.listen(PORT, () => {
+  console.log('Flavoria is running');
+  console.log(`  Customer tablets:  http://localhost:${PORT}/table/1 ... /table/${TABLE_COUNT}`);
+  console.log(`  Restaurant admin:  http://localhost:${PORT}/admin`);
+  console.log(`  Database:          ${DB_FILE}`);
+  whisper.start();
+});

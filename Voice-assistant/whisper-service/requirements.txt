@@ -1,0 +1,8 @@
+# Install PyTorch first with the build that matches your hardware, e.g. for an NVIDIA GPU:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# or for CPU only:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+openai-whisper @ git+https://github.com/openai/whisper.git
+numpy
+# Piper text-to-speech with the "Amy" voice used by the Alice assistant; the voice downloads on first start
+piper-tts

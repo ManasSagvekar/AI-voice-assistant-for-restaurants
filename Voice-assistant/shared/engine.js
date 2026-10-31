@@ -1,0 +1,390 @@
+// Flavoria "backend" engine: menu data, pricing, guardrails, intent parser, schema validator.
+// Everything here is pure so it can move server-side unchanged.
+
+export const TAX_RATE = 0.08875;
+export const IDLE_LIMIT = 90;          // seconds of inactivity before a session resets
+export const WARN_AT = 30;             // seconds remaining when the "still there?" alert fires
+export const MAX_TURN_MS = 8000;       // max length of a single speech turn
+export const MAX_TURN_CHARS = 160;     // ~8s of speech at 150 wpm
+export const RATE_LIMIT = 6;           // voice commands...
+export const RATE_WINDOW = 60000;      // ...per minute per table session
+export const TABLES = ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'];
+
+export const fmt = (n) => '$' + (Math.round(n * 100) / 100).toFixed(2);
+
+const U = (id) => `https://images.unsplash.com/photo-${id}?auto=format&fit=crop&w=640&q=70`;
+
+export const CATEGORIES = [
+  { id: 'all', label: 'All Dishes' },
+  { id: 'starters', label: 'Starters' },
+  { id: 'mains', label: 'Main Course' },
+  { id: 'pizza', label: 'Pizza' },
+  { id: 'desserts', label: 'Desserts' },
+  { id: 'beverages', label: 'Beverages' },
+  { id: 'specials', label: 'Chef Specials' },
+];
+export const catLabel = (id) => (CATEGORIES.find((c) => c.id === id) || {}).label || id;
+
+// Modifier catalogue. Surcharges live here, server-side, never in user text.
+export const MODIFIERS = {
+  extra_cheese: { label: 'Extra cheese', price: 2.5, re: /\b(extra|more|double) (cheese|parmesan|parm)\b/ },
+  truffle: { label: 'Shaved truffle', price: 6, re: /\b(shaved truffle|truffle shavings?|extra truffle|add truffle)\b/ },
+  add_avocado: { label: 'Add avocado', price: 3, re: /\b(add|extra|with) avocado\b/ },
+  add_chicken: { label: 'Add grilled chicken', price: 6, re: /\b(add|with|extra) chicken\b/ },
+  add_prawns: { label: 'Add prawns', price: 8, re: /\b(add|with|extra) (shrimp|prawns?)\b/ },
+  gf_base: { label: 'Gluten-free base', price: 3, re: /\bgluten[- ]?free (base|crust|pasta|bread|bun)\b/ },
+  extra_shot: { label: 'Extra shot', price: 1.25, re: /\b(extra|double) shot\b/ },
+  oat_milk: { label: 'Oat milk', price: 0.75, re: /\boat milk\b/ },
+  no_garlic: { label: 'No garlic', price: 0, re: /\b(no|without|hold the) garlic\b/ },
+  no_onion: { label: 'No onion', price: 0, re: /\b(no|without|hold the) onions?\b/ },
+  no_nuts: { label: 'No nuts', price: 0, re: /\b(no nuts|nut[- ]free|without nuts)\b/ },
+  dairy_free: { label: 'Dairy-free', price: 0, re: /\b(dairy[- ]free|no dairy|without dairy)\b/ },
+  extra_spicy: { label: 'Extra spicy', price: 0, re: /\b(extra spicy|spicier|extra hot|make it (hot|spicy))\b/ },
+  mild: { label: 'Make it mild', price: 0, re: /\b(mild|less spicy|not (too )?spicy)\b/ },
+  sauce_side: { label: 'Sauce on the side', price: 0, re: /\b(sauce|dressing) on (the )?side\b/ },
+  medium_rare: { label: 'Medium rare', price: 0, re: /\bmedium[- ]rare\b/ },
+  medium: { label: 'Medium', price: 0, re: /\bmedium\b(?![- ]rare)/ },
+  well_done: { label: 'Well done', price: 0, re: /\bwell[- ]done\b/ },
+  no_ice: { label: 'No ice', price: 0, re: /\b(no|without) ice\b/ },
+  less_sugar: { label: 'Less sugar', price: 0, re: /\b(less sugar|less sweet|no sugar)\b/ },
+};
+
+// Which modifiers each category accepts (the tool schema's allow-list).
+export const CATEGORY_MODS = {
+  starters: ['no_garlic', 'no_onion', 'dairy_free', 'extra_spicy', 'mild', 'sauce_side', 'add_avocado'],
+  mains: ['extra_cheese', 'truffle', 'add_avocado', 'add_chicken', 'add_prawns', 'gf_base', 'no_garlic', 'no_onion', 'dairy_free', 'extra_spicy', 'mild', 'sauce_side'],
+  pizza: ['extra_cheese', 'truffle', 'gf_base', 'no_garlic', 'no_onion', 'extra_spicy', 'mild'],
+  desserts: ['no_nuts', 'dairy_free'],
+  beverages: ['no_ice', 'less_sugar', 'oat_milk', 'extra_shot'],
+};
+export const allowedMods = (item) =>
+  (CATEGORY_MODS[item.category] || []).concat(item.doneness ? ['medium_rare', 'medium', 'well_done'] : []);
+
+const ALL_MEALS = ['breakfast', 'lunch', 'dinner'];
+const LD = ['lunch', 'dinner'];
+
+export const SEED_MENU = [
+  { id: 'burrata', name: 'Burrata & Heirloom Tomato', desc: 'Pugliese burrata, heirloom tomatoes, basil oil, aged balsamic', category: 'starters', price: 16, rating: 4.8, reviews: 214, diet: 'veg', vegan: false, gf: true, spicy: 0, meals: LD, allergens: ['dairy'], prep: 8, img: U('1608897013039-887f21d8c804'), aliases: ['burrata'] },
+  { id: 'bruschetta', name: 'Wild Mushroom Bruschetta', desc: 'Grilled sourdough, roasted chanterelles, thyme, garlic confit', category: 'starters', price: 13, rating: 4.6, reviews: 158, diet: 'veg', vegan: true, gf: false, spicy: 0, meals: LD, allergens: ['gluten'], prep: 7, img: U('1572695157366-5e585ab2b69f'), aliases: ['bruschetta', 'mushroom bruschetta'] },
+  { id: 'tartare', name: 'Yellowfin Tuna Tartare', desc: 'Avocado mousse, yuzu ponzu, chili crisp, sesame tuile', category: 'starters', price: 19, rating: 4.9, reviews: 189, diet: 'nonveg', vegan: false, gf: true, spicy: 1, meals: ['dinner'], allergens: ['fish', 'soy', 'sesame'], prep: 10, chefSpecial: true, img: U('1534604973900-c43ab4c2e0ab'), aliases: ['tuna tartare', 'tartare', 'tuna'] },
+  { id: 'paneer', name: 'Smoked Paneer Tikka', desc: 'Tandoor-charred paneer, kashmiri chili, mint chutney', category: 'starters', price: 15, rating: 4.7, reviews: 241, diet: 'veg', vegan: false, gf: true, spicy: 2, meals: LD, allergens: ['dairy'], prep: 12, img: U('1567188040759-fb8a883dc6d8'), aliases: ['paneer tikka', 'paneer'] },
+  { id: 'calamari', name: 'Crispy Calamari', desc: 'Semolina-dusted squid, Calabrian chili aioli, charred lemon', category: 'starters', price: 15, rating: 4.5, reviews: 132, diet: 'nonveg', vegan: false, gf: false, spicy: 2, meals: LD, allergens: ['molluscs', 'gluten', 'egg'], prep: 9, img: U('1599487488170-d11ec9c172f0'), aliases: ['calamari', 'squid'] },
+  { id: 'salmon', name: 'Grilled Atlantic Salmon', desc: 'Lemon beurre blanc, charred asparagus, crushed new potatoes', category: 'mains', price: 32, rating: 4.8, reviews: 302, diet: 'nonveg', vegan: false, gf: true, spicy: 0, meals: LD, allergens: ['fish', 'dairy'], prep: 18, img: U('1467003909585-2f8a72700288'), aliases: ['grilled salmon', 'salmon'] },
+  { id: 'risotto', name: 'Truffle Mushroom Risotto', desc: 'Carnaroli rice, porcini, black truffle, 24-month parmigiano', category: 'mains', price: 28, rating: 4.9, reviews: 377, diet: 'veg', vegan: false, gf: true, spicy: 0, meals: LD, allergens: ['dairy'], prep: 20, chefSpecial: true, img: U('1476124369491-e7addf5db371'), aliases: ['truffle mushroom risotto', 'truffle risotto', 'mushroom risotto', 'risotto'] },
+  { id: 'ribeye', name: 'Dry-Aged Ribeye Steak', desc: '14 oz, 45-day dry-aged, bone marrow butter, pommes frites', category: 'mains', price: 54, rating: 4.9, reviews: 266, diet: 'nonveg', vegan: false, gf: true, spicy: 0, meals: ['dinner'], allergens: ['dairy'], prep: 25, chefSpecial: true, doneness: true, img: U('1600891964092-4316c288032e'), aliases: ['ribeye steak', 'ribeye', 'rib eye', 'steak'] },
+  { id: 'lamb', name: 'Rosemary Lamb Rack', desc: 'Herb crust, smoked aubergine, pomegranate jus', category: 'mains', price: 46, rating: 4.7, reviews: 118, diet: 'nonveg', vegan: false, gf: true, spicy: 1, meals: ['dinner'], allergens: [], prep: 24, doneness: true, img: U('1514516345957-556ca7d90a29'), aliases: ['lamb rack', 'lamb'] },
+  { id: 'curry', name: 'Thai Green Vegetable Curry', desc: 'Coconut green curry, Thai aubergine, jasmine rice, bird’s eye chili', category: 'mains', price: 24, rating: 4.6, reviews: 199, diet: 'veg', vegan: true, gf: true, spicy: 3, meals: LD, allergens: ['coconut'], prep: 15, img: U('1455619452474-d2be8b1e70cd'), aliases: ['green curry', 'thai curry', 'curry'] },
+  { id: 'arrabbiata', name: 'Penne all’Arrabbiata', desc: 'Bronze-cut penne, San Marzano tomato, garlic, peperoncino', category: 'mains', price: 22, rating: 4.5, reviews: 144, diet: 'veg', vegan: true, gf: false, spicy: 2, meals: LD, allergens: ['gluten'], prep: 14, img: U('1563379926898-05f4575a45d8'), aliases: ['penne arrabbiata', 'arrabbiata', 'arrabiata', 'penne'] },
+  { id: 'shakshuka', name: 'Harissa Shakshuka', desc: 'Baked eggs, harissa tomato, labneh, grilled flatbread', category: 'mains', price: 18, rating: 4.6, reviews: 97, diet: 'veg', vegan: false, gf: false, spicy: 2, meals: ['breakfast', 'lunch'], allergens: ['egg', 'dairy', 'gluten'], prep: 14, img: U('1590412200988-a436970781fa'), aliases: ['shakshuka', 'shakshouka'] },
+  { id: 'avotoast', name: 'Avocado & Poached Egg Toast', desc: 'Sourdough, smashed avocado, chili flakes, soft poached eggs', category: 'mains', price: 17, rating: 4.4, reviews: 176, diet: 'veg', vegan: false, gf: false, spicy: 1, meals: ['breakfast', 'lunch'], allergens: ['gluten', 'egg'], prep: 10, img: U('1541519227354-08fa5d50c44d'), aliases: ['avocado toast', 'avo toast'] },
+  { id: 'pancakes', name: 'Ricotta Buttermilk Pancakes', desc: 'Whipped ricotta, berry compote, maple syrup', category: 'mains', price: 16, rating: 4.7, reviews: 208, diet: 'veg', vegan: false, gf: false, spicy: 0, meals: ['breakfast'], allergens: ['gluten', 'dairy', 'egg'], prep: 12, img: U('1567620905732-2d1ec7ab7445'), aliases: ['pancakes', 'pancake'] },
+  { id: 'margherita', name: 'Margherita Napoletana', desc: 'San Marzano tomato, fior di latte, basil, 48-hour dough', category: 'pizza', price: 21, rating: 4.7, reviews: 288, diet: 'veg', vegan: false, gf: false, spicy: 0, meals: LD, allergens: ['gluten', 'dairy'], prep: 12, img: U('1574071318508-1cdbab80d002'), aliases: ['margherita pizza', 'margherita', 'margarita pizza'] },
+  { id: 'bianca', name: 'Black Truffle Bianca', desc: 'Truffle cream, fontina, wild mushrooms, rocket', category: 'pizza', price: 29, rating: 4.8, reviews: 121, diet: 'veg', vegan: false, gf: false, spicy: 0, meals: ['dinner'], allergens: ['gluten', 'dairy'], prep: 14, chefSpecial: true, img: U('1513104890138-7c749659a591'), aliases: ['black truffle bianca', 'truffle bianca', 'truffle pizza', 'bianca', 'white pizza'] },
+  { id: 'diavola', name: 'Diavola', desc: 'Spicy salami, nduja, chili honey, smoked mozzarella', category: 'pizza', price: 24, rating: 4.6, reviews: 167, diet: 'nonveg', vegan: false, gf: false, spicy: 3, meals: LD, allergens: ['gluten', 'dairy'], prep: 12, img: U('1628840042765-356cda07504e'), aliases: ['diavola pizza', 'diavola', 'pepperoni pizza', 'salami pizza'] },
+  { id: 'tiramisu', name: 'Classic Tiramisu', desc: 'Savoiardi, espresso, mascarpone, cocoa', category: 'desserts', price: 12, rating: 4.9, reviews: 412, diet: 'veg', vegan: false, gf: false, spicy: 0, meals: LD, allergens: ['dairy', 'egg', 'gluten'], prep: 5, img: U('1571877227200-a0d98ea607e9'), aliases: ['classic tiramisu', 'tiramisu'] },
+  { id: 'fondant', name: 'Valrhona Chocolate Fondant', desc: 'Molten 70% Guanaja, salted caramel, vanilla bean gelato', category: 'desserts', price: 14, rating: 4.8, reviews: 233, diet: 'veg', vegan: false, gf: false, spicy: 0, meals: ['dinner'], allergens: ['dairy', 'egg', 'gluten'], prep: 12, chefSpecial: true, img: U('1606313564200-e75d5e30476c'), aliases: ['chocolate fondant', 'lava cake', 'fondant', 'chocolate cake'] },
+  { id: 'brulee', name: 'Vanilla Bean Crème Brûlée', desc: 'Madagascar vanilla custard, burnt sugar crust, shortbread', category: 'desserts', price: 11, rating: 4.7, reviews: 187, diet: 'veg', vegan: false, gf: true, spicy: 0, meals: LD, allergens: ['dairy', 'egg'], prep: 5, img: U('1470124182917-cc6e71b22ecc'), aliases: ['creme brulee', 'crème brûlée', 'brulee'] },
+  { id: 'mocktail', name: 'Mango Passion Mocktail', desc: 'Alphonso mango, passion fruit, lime, soda', category: 'beverages', price: 9, rating: 4.8, reviews: 265, diet: 'veg', vegan: true, gf: true, spicy: 0, meals: ALL_MEALS, allergens: [], prep: 4, img: U('1546171753-97d7676e4602'), aliases: ['mango passion mocktail', 'mango mocktail', 'passion mocktail', 'mocktail'] },
+  { id: 'lemonade', name: 'Rose & Cardamom Lemonade', desc: 'Pressed lemon, rose water, green cardamom', category: 'beverages', price: 8, rating: 4.5, reviews: 98, diet: 'veg', vegan: true, gf: true, spicy: 0, meals: LD, allergens: [], prep: 3, img: U('1621263764928-df1444c5e859'), aliases: ['rose lemonade', 'cardamom lemonade', 'lemonade'] },
+  { id: 'flatwhite', name: 'Single-Origin Flat White', desc: 'Ethiopian Yirgacheffe, silky microfoam', category: 'beverages', price: 6, rating: 4.6, reviews: 143, diet: 'veg', vegan: false, gf: true, spicy: 0, meals: ['breakfast', 'lunch'], allergens: ['dairy'], prep: 4, img: U('1510591509098-f4fdc6d0ff04'), aliases: ['flat white', 'coffee', 'latte'] },
+].map((m) => ({ available: true, ...m }));
+
+// ---------- Pricing engine (sole source of truth for money) ----------
+export function priceLine(menu, line) {
+  const item = menu.find((m) => m.id === line.itemId);
+  if (!item) return { unit: 0, modsTotal: 0, total: 0 };
+  const modsTotal = (line.mods || []).reduce((s, k) => s + ((MODIFIERS[k] && MODIFIERS[k].price) || 0), 0);
+  const unit = item.price + modsTotal;
+  return { unit, modsTotal, total: unit * line.qty };
+}
+export function totals(menu, lines) {
+  const subtotal = lines.reduce((s, l) => {
+    const item = menu.find((m) => m.id === l.itemId);
+    return item && item.available ? s + priceLine(menu, l).total : s;
+  }, 0);
+  const tax = subtotal * TAX_RATE;
+  return { subtotal, tax, total: subtotal + tax };
+}
+
+// ---------- Filters ----------
+export const EMPTY_FILTERS = { diet: null, vegan: false, gf: false, spice: null, meal: null, category: 'all', maxPrice: null };
+export function matchesFilters(item, f) {
+  if (f.category === 'specials' && !item.chefSpecial) return false;
+  if (f.category !== 'all' && f.category !== 'specials' && item.category !== f.category) return false;
+  if (f.diet && item.diet !== f.diet) return false;
+  if (f.vegan && !item.vegan) return false;
+  if (f.gf && !item.gf) return false;
+  if (f.spice === 'spicy' && item.spicy < 1) return false;
+  if (f.spice === 'mild' && item.spicy > 0) return false;
+  if (f.meal && !item.meals.includes(f.meal)) return false;
+  if (f.maxPrice && item.price > f.maxPrice) return false;
+  return true;
+}
+export function describeFilters(f) {
+  const adj = [];
+  if (f.spice === 'spicy') adj.push('spicy');
+  if (f.spice === 'mild') adj.push('mild');
+  if (f.vegan) adj.push('vegan');
+  else if (f.diet === 'veg') adj.push('vegetarian');
+  if (f.diet === 'nonveg') adj.push('non-veg');
+  if (f.gf) adj.push('gluten-free');
+  const noun = f.category === 'all' ? 'dishes' : f.category === 'specials' ? 'chef specials' : catLabel(f.category).toLowerCase() + (f.category === 'pizza' ? 's' : f.category === 'mains' ? 's' : '');
+  let s = [...adj, noun].join(' ');
+  if (f.meal) s += ' for ' + f.meal;
+  if (f.maxPrice) s += ' under ' + fmt(f.maxPrice).replace('.00', '');
+  return s;
+}
+
+// ---------- Input guardrail layer ----------
+const GUARD_RULES = [
+  { kind: 'prompt-injection', re: /\b(ignore|forget|disregard|override|bypass)\b.{0,30}\b(rules?|instructions?|prompts?|guidelines?|polic(y|ies)|previous|above|system)\b/ },
+  { kind: 'prompt-injection', re: /\b(system prompt|developer mode|jailbreak|you are now|pretend (you|to be)|act as (an?|the)|admin mode|root access)\b/ },
+  { kind: 'price-manipulation', re: /\b(set|change|make|update|lower|drop)\b.{0,25}\b(price|cost|bill|total)s?\b|\bprices? (to|=)\s*\$?\d|\bfor free\b|\bon the house\b|\b100 ?% off\b|\bdiscount\b|\bcoupon\b|\bcomp (my|the|our)\b|\bzero dollars\b/ },
+  { kind: 'out-of-scope', re: /\b(write|generate|create|give me|show me)\b.{0,25}\b(python|javascript|script|code|program|sql|function|essay|poem|story)\b|<script|drop table|select \* from|rm -rf|\bbase64\b/ },
+  { kind: 'out-of-scope', re: /\b(weather|stock price|bitcoin|crypto|election|homework|translate this|news today)\b/ },
+];
+export function guardrail(text) {
+  for (const r of GUARD_RULES) if (r.re.test(text)) return { blocked: true, kind: r.kind };
+  return { blocked: false };
+}
+export const REFUSALS = {
+  'prompt-injection': "I'm sorry, I can't change how I work. I'm here to help with our menu, your order and table service.",
+  'price-manipulation': "I'm sorry, prices are set by the restaurant and can't be changed from the table. I'm happy to help you find something within your budget.",
+  'out-of-scope': "That's outside what I can help with here. I can recommend dishes, take your order, call a server or bring the bill.",
+};
+
+// ---------- Speech safety parsing ----------
+export function sanitizeTranscript(raw) {
+  let t = String(raw || '').replace(/[\u0000-\u001f\u007f<>{}`]/g, ' ').replace(/\s+/g, ' ').trim();
+  let truncated = false;
+  if (t.length > MAX_TURN_CHARS) {
+    t = t.slice(0, MAX_TURN_CHARS).replace(/\s+\S*$/, '');
+    truncated = true;
+  }
+  return { text: t, truncated };
+}
+
+// ---------- Simulated LLM intent parser -> tool calls ----------
+const NUM = { a: 1, an: 1, one: 1, single: 1, two: 2, couple: 2, pair: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, twelve: 12 };
+export const norm = (t) =>
+  t.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[’']/g, "'").replace(/&/g, ' and ')
+    .replace(/[^a-z0-9$.%' -]/g, ' ').replace(/\s+/g, ' ').trim();
+
+function findAll(text, alias) {
+  const out = [];
+  let i = text.indexOf(alias);
+  while (i !== -1) {
+    const before = i === 0 ? ' ' : text[i - 1];
+    let end = i + alias.length;
+    if (text.slice(end, end + 2) === 'es' && !/[a-z]/.test(text[end + 2] || ' ')) end += 2;
+    else if (text[end] === 's' && !/[a-z]/.test(text[end + 1] || ' ')) end += 1;
+    const after = text[end] || ' ';
+    if (!/[a-z0-9]/.test(before) && !/[a-z0-9]/.test(after)) out.push({ start: i, end });
+    i = text.indexOf(alias, i + 1);
+  }
+  return out;
+}
+export function findItems(text, menu) {
+  const cands = [];
+  for (const item of menu) {
+    const aliases = [norm(item.name), ...(item.aliases || []).map(norm)];
+    for (const a of aliases) for (const m of findAll(text, a)) cands.push({ item, ...m, len: m.end - m.start });
+  }
+  cands.sort((a, b) => b.len - a.len);
+  const picked = [];
+  for (const c of cands) if (!picked.some((p) => c.start < p.end && p.start < c.end)) picked.push(c);
+  return picked.sort((a, b) => a.start - b.start);
+}
+function qtyBefore(text) {
+  const toks = text.trim().split(' ').slice(-4).reverse();
+  for (const t of toks) {
+    if (/^\d+$/.test(t)) return Math.min(parseInt(t, 10), 99);
+    if (t in NUM) return NUM[t];
+    if (!['of', 'the', 'x', 'more', 'order', 'orders', 'portion', 'portions', 'plate', 'plates', 'glass', 'glasses', 'cup', 'cups', 'slice', 'slices'].includes(t)) break;
+  }
+  return 1;
+}
+const wordNum = (w) => (/^\d+$/.test(w) ? parseInt(w, 10) : NUM[w]);
+
+const RE = {
+  callServer: /\b(call|get|send|need|bring|want|page)\b.{0,15}\b(server|waiter|waitress|staff|someone|manager|host)\b|\b(assistance|help please)\b/,
+  bill: /\b(bill|check please|the check|our check|my check|split the check|pay(ing)? now|ready to pay|settle up)\b/,
+  split: /\bsplit\b.*?\b(\d+|two|three|four|five|six|seven|eight|nine|ten)\b|\b(\d+|two|three|four|five|six|seven|eight)\s+ways\b/,
+  placeOrder: /\b(place|send|submit|confirm|finali[sz]e)\b.{0,15}\border\b|\bthat'?s all\b|\bthat is all\b|\bsend it to the kitchen\b/,
+  cart: /\b(my|our) (cart|order|basket)\b|\bwhat (did|have) (i|we) order(ed)?\b/,
+  clear: /\b(clear|reset|remove)\b.{0,12}\bfilters?\b|\bshow (me )?(everything|all dishes|the (whole|full) menu|full menu)\b|\bstart over\b/,
+  remove: /\b(remove|delete|cancel|take off|drop|no more)\b/,
+  question: /\b(what'?s in|what is in|tell me about|describe|ingredients|is the|is it|does the|does it|how spicy|what comes with|allergens?|calories|what is the|what'?s the)\b/,
+  recommend: /\b(recommend|suggest|what'?s good|popular|signature|favou?rite|surprise me)\b/,
+  priceAttempt: /\$\s*\d+(\.\d+)?|\b\d+\s*(dollars|bucks)\b/,
+  allergy: /\ballerg(?:y|ic|ies)\b(?: to)? ([a-z ]{3,30}?)(?=[,.;!?]|\s+(?:and|please|so|but|add)\b|$)/,
+};
+
+export function extractFilters(t) {
+  const f = { ...EMPTY_FILTERS };
+  let found = false;
+  if (/\bnon[- ]?veg(etarian)?\b|\bmeat\b|\b(chicken|beef|lamb|seafood|fish|pork)\b/.test(t)) { f.diet = 'nonveg'; found = true; }
+  else if (/\b(vegetarian|veggie|veg)\b/.test(t)) { f.diet = 'veg'; found = true; }
+  if (/\b(vegan|plant[- ]based)\b/.test(t)) { f.vegan = true; f.diet = 'veg'; found = true; }
+  if (/\bgluten[- ]?free\b|\bceliac\b|\bcoeliac\b|\bno gluten\b/.test(t)) { f.gf = true; found = true; }
+  if (/\b(not spicy|mild|no spice|not too hot)\b/.test(t)) { f.spice = 'mild'; found = true; }
+  else if (/\b(spicy|hot|fiery|chil(l)?i|heat)\b/.test(t)) { f.spice = 'spicy'; found = true; }
+  const meal = t.match(/\b(breakfast|brunch|lunch|dinner|supper)\b/);
+  if (meal) { f.meal = { brunch: 'breakfast', supper: 'dinner' }[meal[1]] || meal[1]; found = true; }
+  const cats = [
+    ['specials', /\bchef'?s? specials?\b|\bspecials\b|\bsignature\b/],
+    ['starters', /\b(starters?|appeti[sz]ers?|small plates?|to start)\b/],
+    ['mains', /\b(mains?|main courses?|entrees?|main dish(es)?)\b/],
+    ['pizza', /\bpizzas?\b/],
+    ['desserts', /\b(desserts?|sweets?|something sweet)\b/],
+    ['beverages', /\b(drinks?|beverages?|mocktails?|juices?|coffee|something to drink)\b/],
+  ];
+  for (const [id, re] of cats) if (re.test(t)) { f.category = id; found = true; break; }
+  const mp = t.match(/\b(under|below|less than|cheaper than|max(?:imum)?|up to|within)\s*\$?\s*(\d{1,3})\b/);
+  if (mp) { f.maxPrice = parseInt(mp[2], 10); found = true; }
+  return { filters: f, found };
+}
+
+// Returns raw "LLM" tool calls. These are untrusted until validateCall() passes them.
+export function parseIntent(raw, menu) {
+  const t = norm(raw);
+  const calls = [];
+  const allergy = raw.toLowerCase().match(RE.allergy);
+  if (allergy) calls.push({ tool: 'set_instructions', args: { text: 'Allergy: ' + allergy[1].trim() } });
+
+  if (RE.callServer.test(t)) return [...calls, { tool: 'call_server', args: { reason: 'Guest requested assistance' } }];
+  if (RE.bill.test(t) || /\bsplit\b/.test(t)) {
+    const sm = t.match(RE.split);
+    const n = sm ? wordNum(sm[1] || sm[2]) : /\bsplit\b/.test(t) ? 2 : 1;
+    return [...calls, { tool: 'request_bill', args: { split_ways: n } }];
+  }
+  if (RE.placeOrder.test(t)) return [...calls, { tool: 'place_order', args: {} }];
+  if (RE.cart.test(t) && !findItems(t, menu).length) return [...calls, { tool: 'open_cart', args: {} }];
+  if (RE.clear.test(t)) return [...calls, { tool: 'clear_filters', args: {} }];
+
+  const hits = findItems(t, menu);
+  if (hits.length) {
+    if (RE.remove.test(t)) return [...calls, ...hits.map((h) => ({ tool: 'remove_from_cart', args: { item_id: h.item.id } }))];
+    if (RE.question.test(t) && !/\b(add|order|i'?ll have|get me)\b/.test(t)) return [...calls, { tool: 'describe_item', args: { item_id: hits[0].item.id } }];
+    const priceAttempt = t.match(RE.priceAttempt);
+    hits.forEach((h, i) => {
+      const tail = t.slice(h.end, i + 1 < hits.length ? hits[i + 1].start : t.length);
+      const mods = Object.keys(MODIFIERS).filter((k) => MODIFIERS[k].re.test(tail));
+      const args = { item_id: h.item.id, qty: qtyBefore(t.slice(i ? hits[i - 1].end : 0, h.start)), modifiers: mods };
+      // A naive LLM would happily copy a user-stated price into the call. The validator must strip it.
+      if (priceAttempt) args.unit_price = parseFloat(priceAttempt[0].replace(/[^0-9.]/g, ''));
+      calls.push({ tool: 'add_to_cart', args });
+    });
+    return calls;
+  }
+  const { filters, found } = extractFilters(t);
+  if (found) return [...calls, { tool: 'apply_filters', args: filters }];
+  if (RE.recommend.test(t)) return [...calls, { tool: 'apply_filters', args: { ...EMPTY_FILTERS, category: 'specials' } }];
+  if (calls.length) return calls;
+  return [{ tool: 'fallback', args: {} }];
+}
+
+// ---------- Strict tool-call schema validation ----------
+const MEALS = ['breakfast', 'lunch', 'dinner'];
+const T = {
+  str: (max) => (v) => (typeof v === 'string' && v.length <= max ? null : `must be a string of at most ${max} chars`),
+  int: (min, max) => (v) => (Number.isInteger(v) && v >= min && v <= max ? null : `must be an integer ${min}-${max}`),
+  num: (min, max) => (v) => (v === null || (typeof v === 'number' && v >= min && v <= max) ? null : `must be null or ${min}-${max}`),
+  bool: (v) => (typeof v === 'boolean' ? null : 'must be boolean'),
+  oneOf: (list) => (v) => (list.includes(v) ? null : `must be one of ${list.map(String).join(', ')}`),
+};
+export const TOOL_SCHEMAS = {
+  apply_filters: {
+    diet: T.oneOf([null, 'veg', 'nonveg']), vegan: T.bool, gf: T.bool, spice: T.oneOf([null, 'spicy', 'mild']),
+    meal: T.oneOf([null, ...MEALS]), category: T.oneOf(CATEGORIES.map((c) => c.id)), maxPrice: T.num(1, 500),
+  },
+  clear_filters: {},
+  add_to_cart: { item_id: 'menu_item', qty: T.int(1, 10), modifiers: 'modifier_list' },
+  remove_from_cart: { item_id: 'menu_item' },
+  describe_item: { item_id: 'menu_item' },
+  call_server: { reason: T.str(80) },
+  request_bill: { split_ways: T.int(1, 12) },
+  place_order: {},
+  open_cart: {},
+  set_instructions: { text: T.str(120) },
+  fallback: {},
+};
+const MONEY_KEYS = /price|cost|total|amount|discount|subtotal|tax/i;
+
+export function validateCall(call, menu) {
+  const errors = [], stripped = [];
+  const schema = TOOL_SCHEMAS[call.tool];
+  if (!schema) return { ok: false, errors: [`unknown tool "${call.tool}"`], stripped, args: {} };
+  const args = {};
+  for (const [k, v] of Object.entries(call.args || {})) {
+    if (!(k in schema)) { stripped.push({ key: k, value: v, money: MONEY_KEYS.test(k) }); continue; }
+    const rule = schema[k];
+    if (rule === 'menu_item') {
+      if (!menu.some((m) => m.id === v)) errors.push(`${k}: "${v}" is not on the menu`);
+      else args[k] = v;
+    } else if (rule === 'modifier_list') {
+      const item = menu.find((m) => m.id === call.args.item_id);
+      const allowed = item ? allowedMods(item) : [];
+      args[k] = [];
+      for (const mod of Array.isArray(v) ? v.slice(0, 6) : []) {
+        if (allowed.includes(mod)) args[k].push(mod);
+        else stripped.push({ key: `${k}.${mod}`, value: MODIFIERS[mod] ? MODIFIERS[mod].label : mod, money: false, notAllowed: true });
+      }
+    } else {
+      const e = rule(v);
+      if (e) errors.push(`${k} ${e}`);
+      else args[k] = v;
+    }
+  }
+  for (const k of Object.keys(schema)) {
+    if (!(k in args) && (schema[k] === 'menu_item' || (call.tool === 'add_to_cart' && k === 'qty'))) {
+      if (!errors.some((e) => e.startsWith(k))) errors.push(`${k} is required`);
+    }
+  }
+  return { ok: errors.length === 0, errors, stripped, args };
+}
+
+// ---------- Menu ingestion helpers ----------
+export function inferTags(name, desc = '') {
+  const t = norm(name + ' ' + desc);
+  const nonveg = /\b(chicken|beef|(?<!(cauliflower|tofu|mushroom|celeriac|cabbage) )steak|lamb|pork|duck|boar|bacon|salami|nduja|prosciutto|fish|salmon|tuna|cod|shrimp|prawns?|crab|lobster|squid|calamari|anchov(y|ies)|veal|venison)\b/.test(t);
+  const dairy = /\b(cheese|cream|butter|milk|ricotta|mascarpone|parmesan|parmigiano|burrata|mozzarella|fior di latte|yogurt|labneh|gelato|creme|anglaise|custard|pecorino)\b/.test(t);
+  const egg = /\b(egg|eggs|aioli|mayo)\b/.test(t);
+  const gluten = /\b(bread|pasta|pappardelle|penne|spaghetti|pizza|dough|crust|toast|tart|tatin|brioche|flatbread|sourdough|cake)\b/.test(t);
+  const nuts = /\b(walnut|almond|pecan|hazelnut|pistachio|cashew|peanut)s?\b/.test(t);
+  let category = 'mains';
+  if (/\b(soup|veloute|salad|tartare|bruschetta|carpaccio|starter|croquette)s?\b/.test(t)) category = 'starters';
+  if (/\b(tart|tatin|cake|mousse|gelato|sorbet|pudding|brulee|tiramisu|panna cotta|dessert)\b/.test(t)) category = 'desserts';
+  if (/\b(mocktail|cocktail|lemonade|juice|coffee|tea|soda|old fashioned|spritz|zero[- ]proof)\b/.test(t)) category = 'beverages';
+  if (/\bpizza\b/.test(norm(name))) category = 'pizza';
+  const spicy = /\b(nduja|chili|chilli|harissa|jalapeno|peppercorn|spicy|vindaloo)\b/.test(t) ? 2 : /\b(pepper|smoked paprika|ginger)\b/.test(t) ? 1 : 0;
+  const allergens = [dairy && 'dairy', egg && 'egg', gluten && 'gluten', nuts && 'nuts'].filter(Boolean);
+  return {
+    category, diet: nonveg ? 'nonveg' : 'veg', vegan: !nonveg && !dairy && !egg, gf: !gluten, spicy, allergens,
+    meals: category === 'beverages' ? ['lunch', 'dinner'] : /\b(pancake|egg|toast|brunch)\b/.test(t) ? ['breakfast', 'lunch'] : ['lunch', 'dinner'],
+  };
+}
+
+export function parseMenuText(text) {
+  const rows = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const m = line.match(/^(.{3,60}?)\s*(?:[-–—|:,.\t]+\s*)?\$?\s*(\d{1,3}(?:\.\d{1,2})?)\s*(?:[-–—|:,\t]+\s*(.*))?$/);
+    if (!m) continue;
+    const name = m[1].replace(/[.\s]+$/, '').trim();
+    const desc = (m[3] || '').trim();
+    rows.push({ name, desc, price: parseFloat(m[2]), conf: desc ? 0.94 : 0.81, ...inferTags(name, desc) });
+  }
+  return rows.slice(0, 40);
+}
+
+export const SAMPLE_EXTRACTION = [
+  { name: 'Roasted Butternut Velouté', desc: 'Sage brown butter, toasted pepitas, crème fraîche', price: 12 },
+  { name: 'Duck Confit Salad', desc: 'Frisée, candied walnuts, orange segments, sherry vinaigrette', price: 18 },
+  { name: 'Wild Boar Pappardelle', desc: 'Slow-braised boar ragù, juniper, pecorino', price: 34 },
+  { name: 'Charred Cauliflower Steak', desc: 'Smoked paprika romesco, golden raisins, herb salsa', price: 26 },
+  { name: 'Nduja & Hot Honey Pizza', desc: 'Calabrian nduja, fior di latte, chili honey', price: 25 },
+  { name: 'Spiced Pear Tarte Tatin', desc: 'Star anise caramel, cinnamon crème anglaise', price: 13 },
+  { name: 'Smoked Maple Old Fashioned (zero-proof)', desc: 'Seedlip Spice, smoked maple, orange bitters', price: 11, lowConf: 'Price partly obscured on page 2' },
+].map((r, i) => ({ ...r, conf: r.lowConf ? 0.72 : [0.97, 0.93, 0.91, 0.88, 0.95, 0.9][i], ...inferTags(r.name, r.desc) }));

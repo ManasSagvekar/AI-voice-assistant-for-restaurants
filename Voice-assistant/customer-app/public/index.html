@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;1,400;1,500&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/app.css?v=3">
+<title>Tazte</title>
+</head>
+<body>
+<div class="fixed right-0 z-50 gutter" style="top: max(16px, env(safe-area-inset-top, 0px))">
+  <div class="relative">
+    <button id="acct-btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="acct-pop" aria-label="Switch account"
+      class="glass-nav rounded-full pl-1.5 pr-3 py-1.5 flex items-center gap-2 text-sm font-medium text-ink hover:bg-white/80 transition">
+      <span data-avatar class="w-8 h-8 rounded-full flex items-center justify-center font-semibold"></span>
+      <span data-name></span>
+      <svg viewBox="0 0 24 24" class="w-4 h-4 text-muted" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <div id="acct-pop" role="menu" aria-labelledby="acct-btn" hidden class="acct-pop glass-strong shadow-2xl absolute right-0 mt-2 w-[min(320px,calc(100vw-32px))] rounded-[28px] p-2">
+      <div class="text-center px-4 pt-5 pb-4">
+        <span data-avatar-lg class="mx-auto w-16 h-16 rounded-full flex items-center justify-center font-serif text-3xl"></span>
+        <p class="font-serif text-2xl mt-3" data-hi></p>
+        <p class="text-[12.5px] text-muted mt-0.5" data-sub></p>
+        <a data-action class="inline-flex mt-4 rounded-full border border-ink/70 px-4 py-2 text-[13px] font-medium text-ink hover:bg-white/70 transition"></a>
+      </div>
+      <p class="label px-3 pt-2 pb-1.5 border-t border-line/70">Switch account</p>
+      <button type="button" role="menuitemradio" data-acct="guest" class="acct-row w-full flex items-center gap-3 rounded-2xl px-3 py-2.5 text-left hover:bg-white/70 transition">
+        <span class="w-9 h-9 shrink-0 rounded-full flex items-center justify-center font-semibold bg-gold text-white">G</span>
+        <span class="flex-1 min-w-0"><span class="block font-medium text-ink">Guest</span><span class="block text-[12px] text-muted">Order from your table</span></span>
+        <svg viewBox="0 0 24 24" class="acct-check invisible w-5 h-5 text-gold-dark" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 5 5L20 7"/></svg>
+      </button>
+      <button type="button" role="menuitemradio" data-acct="restaurant" class="acct-row w-full flex items-center gap-3 rounded-2xl px-3 py-2.5 text-left hover:bg-white/70 transition">
+        <span class="w-9 h-9 shrink-0 rounded-full flex items-center justify-center font-semibold bg-ink text-gold">R</span>
+        <span class="flex-1 min-w-0"><span class="block font-medium text-ink">Restaurant</span><span class="block text-[12px] text-muted">Staff dashboard · PIN required</span></span>
+        <svg viewBox="0 0 24 24" class="acct-check invisible w-5 h-5 text-gold-dark" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 5 5L20 7"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<main class="gutter min-h-[100vh] flex items-center justify-center py-24 text-center">
+  <div class="w-full max-w-3xl mx-auto">
+    <img src="/assets/tazte-logo.png?v=2" alt="Tazte logo" class="w-[180px] h-auto mx-auto">
+    <h1 class="font-serif text-4xl sm:text-5xl mt-8">Your AI assistant Waiter.</h1>
+    <section data-for="guest" class="glass rounded-2xl p-5 mt-8 max-w-xl mx-auto text-center">
+      <p class="label">For guests</p>
+      <h2 class="font-serif text-2xl mt-1">Table tablets</h2>
+      <p class="text-sm text-muted mt-1">Choose your table.</p>
+      <div id="tables" class="flex flex-wrap gap-2 mt-4 justify-center"></div>
+    </section>
+    <section data-for="restaurant" hidden class="glass rounded-2xl p-5 mt-8 max-w-xl mx-auto text-center">
+      <p class="label">For staff</p>
+      <h2 class="font-serif text-2xl mt-1">Restaurant dashboard</h2>
+      <p class="text-sm text-muted mt-1">Live orders, tables, menu and service requests. Sign in with your staff PIN.</p>
+      <a href="/admin" class="btn-gold mt-4 inline-flex justify-center">Login</a>
+    </section>
+  </div>
+</main>
+<script src="/assets/landing.js?v=2"></script>
+</body>
+</html>
