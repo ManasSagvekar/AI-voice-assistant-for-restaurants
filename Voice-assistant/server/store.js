@@ -49,6 +49,12 @@ export function createStore(file) {
     );
     CREATE TABLE IF NOT EXISTS staff_sessions (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    DROP TABLE IF EXISTS devices; -- tablet pairing was removed
+    DROP TABLE IF EXISTS pairing_codes;
+    CREATE TABLE IF NOT EXISTS allergen_log (
+      id TEXT PRIMARY KEY, at INTEGER NOT NULL, table_id TEXT NOT NULL, item_name TEXT NOT NULL, allergen TEXT NOT NULL,
+      answer TEXT NOT NULL CHECK (answer IN ('contains', 'free', 'unknown'))
+    );
   `);
 
   const q = (sql) => db.prepare(sql);
@@ -78,8 +84,8 @@ export function createStore(file) {
     const m = item(itemId);
     if (!m) return null;
     const next = { ...m, ...patch };
-    if (patch.vegan) next.diet = 'veg';
-    if (patch.diet === 'nonveg') next.vegan = false;
+    if (patch.vegan || patch.jain) next.diet = 'veg';
+    if (patch.diet === 'nonveg') { next.vegan = false; next.jain = false; }
     saveItem(next);
     return next;
   });
@@ -103,12 +109,13 @@ export function createStore(file) {
     .all(table).map((r) => ({ id: r.id, itemId: r.item_id, qty: r.qty, mods: JSON.parse(r.mods) }));
   const note = (table) => (q('SELECT note FROM table_notes WHERE table_id = ?').get(table) || {}).note || '';
 
-  const addToCart = tx((table, itemId, qty, mods) => {
+  const writeToCart = (table, itemId, qty, mods) => {
     const key = [...mods].sort().join(',');
     const same = cart(table).find((l) => l.itemId === itemId && [...l.mods].sort().join(',') === key);
     if (same) q('UPDATE cart_lines SET qty = ? WHERE id = ?').run(Math.min(10, same.qty + qty), same.id);
-    else q('INSERT INTO cart_lines (id, table_id, item_id, qty, mods, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id('L'), table, itemId, qty, json(mods), now());
-  });
+    else q('INSERT INTO cart_lines (id, table_id, item_id, qty, mods, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id('L'), table, itemId, Math.min(10, qty), json(mods), now());
+  };
+  const addToCart = tx(writeToCart);
   const changeQty = tx((table, lineId, delta) => {
     const l = q('SELECT qty FROM cart_lines WHERE id = ? AND table_id = ?').get(lineId, table);
     if (!l) return false;
@@ -160,6 +167,21 @@ export function createStore(file) {
     clearTable(table);
     return order.id;
   });
+  // A guest may take an order back shortly after sending it, as long as the kitchen hasn't started it.
+  // Its dishes go back into the cart so they can be changed.
+  const cancelOrder = tx((table, orderId, windowMs) => {
+    const r = q('SELECT * FROM orders WHERE id = ? AND table_id = ? AND paid = 0').get(orderId, table);
+    if (!r) return { ok: false, reason: 'not_found' };
+    if (r.status !== 'received' || r.created_at < now() - windowMs) return { ok: false, reason: 'too_late' };
+    for (const l of JSON.parse(r.lines)) if (item(l.itemId)) writeToCart(table, l.itemId, l.qty, l.mods);
+    if (r.note) setNote(table, note(table) ? `${note(table)}; ${r.note}` : r.note);
+    q('DELETE FROM orders WHERE id = ?').run(orderId);
+    return { ok: true, id: orderId };
+  });
+  const latestOrder = (table) => {
+    const r = q('SELECT * FROM orders WHERE table_id = ? AND paid = 0 ORDER BY created_at DESC LIMIT 1').get(table);
+    return r ? rowToOrder(r) : null;
+  };
   const advanceOrder = (orderId) => {
     const r = q('SELECT status FROM orders WHERE id = ?').get(orderId);
     if (!r) return false;
@@ -206,9 +228,23 @@ export function createStore(file) {
   const dropSession = (hash) => q('DELETE FROM staff_sessions WHERE token_hash = ?').run(hash);
   const dropAllSessions = () => q('DELETE FROM staff_sessions').run();
 
+  // ---------- allergy questions ----------
+  // A record of what each table was told, so staff can see it and follow up.
+  const logAllergen = (table, itemName, allergen, answer) => {
+    q('INSERT INTO allergen_log (id, at, table_id, item_name, allergen, answer) VALUES (?, ?, ?, ?, ?, ?)').run(id('ALG-'), now(), table, itemName, allergen, answer);
+    q('DELETE FROM allergen_log WHERE at < ?').run(now() - 30 * 864e5);
+  };
+  const allergenLog = () => q('SELECT * FROM allergen_log ORDER BY at DESC LIMIT 60').all()
+    .map((r) => ({ id: r.id, at: r.at, table: r.table_id, item: r.item_name, allergen: r.allergen, answer: r.answer }));
+
+  // ---------- backups ----------
+  // VACUUM INTO writes a consistent copy even while the server keeps working.
+  const backupTo = (file) => db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+
   return {
     db, menu, item, updateItem, publishItems, cart, note, addToCart, changeQty, removeLine, removeItem, setNote, resetTable,
-    tableOrders, recentOrders, placeOrder, advanceOrder, requests, addRequest, setRequestStatus, tableStatuses, setTableOccupied, logSecurity, security,
-    setting, addSession, hasSession, dropSession, dropAllSessions, categories: CATEGORIES,
+    tableOrders, recentOrders, placeOrder, cancelOrder, latestOrder, advanceOrder, requests, addRequest, setRequestStatus, tableStatuses, setTableOccupied,
+    logSecurity, security, setting, addSession, hasSession, dropSession, dropAllSessions,
+    logAllergen, allergenLog, backupTo, categories: CATEGORIES,
   };
 }

@@ -30,9 +30,13 @@ export interface RestaurantRow extends Restaurant {
   requests_24h: number;
 }
 
+// usage_warning: 80% of the voice limit; rate_limit: limit reached, voice slowed; abuse: 3x the
+// limit, access revoked; payment: a Razorpay subscription payment failed or stopped.
+export type AlertKind = 'usage_warning' | 'rate_limit' | 'abuse' | 'payment';
 export interface Alert {
   id: string;
   restaurant_id: string;
+  kind: AlertKind;
   message: string;
   created_at: string;
 }

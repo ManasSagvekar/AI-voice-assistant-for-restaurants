@@ -5,6 +5,7 @@ import { Header } from '@/components/Header';
 import { AlertsPanel } from '@/components/AlertsPanel';
 import { RestaurantTable } from '@/components/RestaurantTable';
 import { AutoRefresh } from '@/components/AutoRefresh';
+import { RemindersButton } from '@/components/RemindersButton';
 
 export const dynamic = 'force-dynamic';
 
@@ -14,7 +15,7 @@ export default async function Dashboard() {
   const [restaurants, usage, alerts] = await Promise.all([
     db.from('restaurants').select(COLUMNS).order('created_at', { ascending: false }),
     db.from('usage_last_24h').select('restaurant_id,requests'),
-    db.from('admin_alerts').select('id,restaurant_id,message,created_at').is('resolved_at', null).order('created_at', { ascending: false }).limit(20),
+    db.from('admin_alerts').select('id,restaurant_id,kind,message,created_at').is('resolved_at', null).order('created_at', { ascending: false }).limit(20),
   ]);
   if (restaurants.error) throw new Error(`Could not load restaurants: ${restaurants.error.message}`);
 
@@ -44,6 +45,7 @@ export default async function Dashboard() {
           ))}
         </section>
         {open.length > 0 && <AlertsPanel alerts={open} />}
+        <RemindersButton />
         <RestaurantTable rows={rows} />
         <p className="footnote">Restaurant revenue, orders and sales values are never collected or stored. Usage is counted as request numbers only.</p>
       </main>

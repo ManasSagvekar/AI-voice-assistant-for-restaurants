@@ -109,3 +109,15 @@
 
   /* Small text sitting straight on the background photo gets a soft light halo so it stays legible. */
   .on-photo { text-shadow: 0 1px 1px rgba(255,255,255,.9), 0 0 10px rgba(255,255,255,.85), 0 0 22px rgba(255,255,255,.6); }
+
+/* Order sent: the check mark pops in once. */
+.sent-pop { animation: pop .45s cubic-bezier(.2,.9,.3,1.4); }
+@keyframes pop { from { transform: scale(.4); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* Kitchen tickets: printing shows only the ticket being printed, sized for an 80 mm receipt printer. */
+@media print {
+  body * { visibility: hidden; }
+  .print-ticket, .print-ticket * { visibility: visible; }
+  .print-ticket { position: absolute; left: 0; top: 0; width: 72mm; border-radius: 0; background: #fff; color: #000; }
+  .print-ticket .no-print { display: none; }
+}

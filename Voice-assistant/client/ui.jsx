@@ -36,6 +36,15 @@ export const Icon = ({ name, className = 'w-5 h-5' }) => {
     check: <path d="m5 12 5 5L20 7" />,
     logout: <><path d="M15 4h4v16h-4" /><path d="M10 8l-4 4 4 4M6 12h10" /></>,
     split: <><path d="M12 3v18" /><path d="M5 8h4M15 8h4M5 16h4M15 16h4" /></>,
+    text: <><path d="M3 18 8 6l5 12M4.8 14h6.4" /><path d="M15 18l3-7 3 7M15.9 16h4.2" /></>,
+    globe: <><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" /></>,
+    undo: <><path d="M9 14 4 9l5-5" /><path d="M4 9h10a6 6 0 0 1 0 12h-3" /></>,
+    info: <><circle cx="12" cy="12" r="9" /><path d="M12 11v5M12 8h.01" /></>,
+    printer: <><path d="M7 9V3h10v6" /><rect x="3" y="9" width="18" height="8" rx="2" /><path d="M7 14h10v7H7Z" /></>,
+    kitchen: <><path d="M6 14h12v6H6Z" /><path d="M6 14a4 4 0 0 1-1.5-7.7A4 4 0 0 1 12 4a4 4 0 0 1 7.5 2.3A4 4 0 0 1 18 14" /></>,
+    phone: <><rect x="7" y="2" width="10" height="20" rx="2" /><path d="M11 18h2" /></>,
+    link: <><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" /><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" /></>,
+    clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
   }[name];
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">{p}</svg>;
 };
@@ -116,6 +125,24 @@ export async function api(path, method = 'GET', body) {
     throw new ApiError(res.status, data);
   }
   return data;
+}
+
+// Short alert tones. Browsers allow sound only after the page has been tapped or clicked once.
+export const TONES = { request: [[880, 0], [1175, 0.16]], order: [[660, 0], [880, 0.14], [1320, 0.28]], warn: [[880, 0], [660, 0.22]] };
+export function chime(kind = 'warn') {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    (TONES[kind] || TONES.warn).forEach(([f, t]) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, ctx.currentTime + t);
+      g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.5);
+      o.connect(g).connect(ctx.destination); o.start(ctx.currentTime + t); o.stop(ctx.currentTime + t + 0.55);
+    });
+    setTimeout(() => ctx.close(), 1400);
+  } catch (e) { /* audio unavailable */ }
 }
 
 // ---------- restaurant & service status ----------

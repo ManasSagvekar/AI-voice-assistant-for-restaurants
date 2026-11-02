@@ -6,6 +6,8 @@ Two apps that share one live database:
 | --- | --- | --- | --- |
 | Customer tablet | `/table/1` … `/table/8` | Guests, one tablet per table | Open, scoped to its own table |
 | Restaurant dashboard | `/restaurant` | Staff | Staff PIN, HttpOnly session cookie (12 h) |
+| Kitchen screen | `/kitchen` | Kitchen | Same staff sign-in |
+| Floor view | `/floor` | Waiters, on their phones | Same staff sign-in |
 
 `/admin` redirects to `/restaurant` when this server runs on its own. When you run `npm run dev` from the workspace root, `/admin` on the same address is the super-admin app instead (see `../Admin`).
 
@@ -30,11 +32,13 @@ Then open `http://localhost:3000`. If you don't set `STAFF_PIN`, the server uses
 | `TABLE_COUNT` | `8` | Number of table tablets |
 | `DB_FILE` | `data/flavoria.db` | SQLite file. Put it on a persistent disk when hosting |
 | `WHISPER_URL` | `http://127.0.0.1:8765` | Whisper service address |
-| `WHISPER_MODEL` | `small.en` | Whisper model the service loads |
+| `WHISPER_MODEL` | `small` | Whisper model the service loads. Multilingual models also understand Hindi and Marathi; `small.en` is English-only |
 | `WHISPER_AUTOSTART` | on | Set to `0` to stop `npm start` launching the Whisper service |
 | `PIPER_VOICE` | `en_US-amy-medium` | Assistant voice ([Piper voices](https://huggingface.co/rhasspy/piper-voices)); downloaded on first start |
 | `SUPABASE_URL`, `SUPABASE_ANON_KEY` | unset | Turns on the restaurant licence (below). Anon key only |
-| `LICENSE_GRACE_MINUTES` | `15` | How long to keep serving on the last known licence status while Supabase is unreachable |
+| `BACKUP_DIR` | `data/backups` | Where nightly database copies go |
+| `BACKUP_COPY_DIR` | unset | A second place for each copy, such as a USB drive or a synced cloud folder |
+| `BACKUP_KEEP`, `BACKUP_HOUR` | `14`, `3` | How many copies to keep, and the hour (local time) of the nightly backup |
 | `RESTAURANT_NAME` | `Restaurant` | Name shown in standalone mode |
 
 Settings can also go in a `.env` file next to `package.json` (see `.env.example`); it is read on start and is git-ignored.
@@ -45,13 +49,26 @@ With `SUPABASE_URL` and `SUPABASE_ANON_KEY` set, this server is licensed by the 
 
 1. **Connect once.** The first visit to `/restaurant` asks for the restaurant username and password from the welcome email. The server signs in to Supabase as that restaurant and keeps only the refresh token (in the `settings` table), so it stays connected across restarts.
 2. **Staff PIN.** Staff then sign in with the 6-digit PIN set in the admin app, checked by Supabase (`verify_staff_pin`). A PIN only works on its own restaurant's server.
-3. **Access checks.** The status is re-checked every 10 seconds and on every voice request (`increment_usage`, which also counts it against the restaurant's rate limit). When the admin marks the restaurant unpaid or suspends it, or it is flagged for abuse or its plan expires, the server closes every staff session and live screen, refuses table and staff requests with `403 service_suspended`, and both apps show a paused screen. Reaching the rate limit blocks that same request.
+3. **Access checks.** The status is re-checked every 10 seconds and on every voice request (`increment_usage`, which also counts it against the restaurant's rate limit). When the admin marks the restaurant unpaid or suspends it, or it is flagged for abuse or its plan expires, the server closes every staff session and live screen, refuses table and staff requests with `403 service_suspended`, and both apps show a paused screen.
+   **Voice limit.** Reaching the plan's voice limit does not close the restaurant. Each table then gets one voice turn every 20 seconds until the hour or day resets, and the tablet uses its own voice instead of Piper; ordering by touch and the staff dashboard are never limited. Staff see a notice from 80%. Only three times the limit in one window counts as abuse and revokes access (this needs the `20261102000000_soft_limits_and_billing.sql` migration).
 4. **Branding.** Both apps show the restaurant's name from the admin app in place of any product logo.
 5. **Privacy.** Only request counts are sent to Supabase. Orders, bills and totals never leave this server.
 
-If Supabase can't be reached, the server keeps serving on the last known status for `LICENSE_GRACE_MINUTES`, still enforcing the plan's end date locally; after that it pauses until the connection returns. `server/license.js` holds this logic and `server/supabase.js` the minimal REST client.
+If Supabase can't be reached, the server keeps serving on the last known status until the plan's end date, so an internet outage never stops dinner service; staff see an "offline" notice. A suspension made in the admin app while the restaurant is offline takes effect when it reconnects. `server/license.js` holds this logic and `server/supabase.js` the minimal REST client.
 
 Staff can change the active table count from the dashboard's **Tables** tab (1–99). The value is stored in SQLite and takes precedence over `TABLE_COUNT` on later starts; `TABLE_COUNT` is used as the initial value for a fresh database. Reducing the count disables those table URLs but retains their saved data.
+
+## Tablets, ordering and service
+
+**Sending an order.** Nothing reaches the kitchen until the guest confirms a read-back: tapping **Send to kitchen** shows the order and total first, and saying "send my order" makes the assistant read it back and wait for a yes. If the owner has chosen a dish to suggest with something in the order (Menu Control, **Details**, "Suggest with this dish"), it is offered once per order. For one minute after sending, and only until the kitchen starts it, the guest can take the order back (**Undo** on the tablet, or "cancel my order"); the dishes return to the cart.
+
+**Allergies.** Each dish has an allergen list and a "the kitchen has checked this list" tick (Menu Control, **Details**). The assistant answers allergy questions ("does the korma have nuts?") only for ticked dishes; otherwise it calls a server and says so. "Nut-free" style filters show only ticked dishes. Every allergy question and its answer is listed under Service Requests. Dishes can also be tagged Jain and Halal.
+
+**Guests.** The tablet has a language dropdown for English, Hindi, Marathi, Spanish, French, Arabic, German, Portuguese, Mandarin Chinese, Japanese, Bengali, Tamil and Telugu, plus a display menu for larger text, a slower voice and more time to speak. Every spoken reply is also shown as a large caption. Non-English speech is translated to English by Whisper, so it needs a multilingual model (the default). Tablet labels and assistant replies are translated for English, Hindi and Marathi; the other selected languages currently use English text. Staff can add Hindi and Marathi dish names. Typed requests are understood in English. Holding the mic button records until it's released, for a loud room; staff can switch tablets to **Noisy room** (Tables tab), which ignores more background noise. A note under the assistant tells guests where their voice goes, and **Voice privacy: This computer only** turns off Google's online voices and the browser's speech recognition.
+
+**Kitchen and floor.** `/kitchen` shows tickets oldest first with a timer against the dish's prep time, a bump button, a sound for new orders and optional printing (80 mm receipt layout; with **Print new tickets**, each ticket prints once the guest's undo minute has passed). `/floor` is for waiters' phones: open requests by waiting time with sound and vibration, seated tables with how long they've been seated, and a "my tables" choice kept on the phone.
+
+**Backups.** The database is copied every night, and soon after start if the last copy is over a day old, to `BACKUP_DIR`, plus `BACKUP_COPY_DIR` if set. The Tables tab shows the last backup and has **Back up now**. To restore, stop the server and replace `data/flavoria.db` with a backup file.
 
 Tables start **Available** and become **Occupied** when the first order is sent to the kitchen. On upgrade, old session-only occupancy is reconciled against unpaid orders. The staff dashboard's **Tables** tab has a status switch for manually marking a table occupied or available. Guests can only select available tables from the landing page; opening an occupied table URL redirects them back to the table chooser. Marking a bill request paid also returns its table to **Available**.
 
@@ -71,7 +88,7 @@ whisper-service/.venv/Scripts/python -m pip install torch --index-url https://do
 whisper-service/.venv/Scripts/python -m pip install -r whisper-service/requirements.txt
 ```
 
-(On macOS/Linux the interpreter is `whisper-service/.venv/bin/python`.) After that, `npm start` launches the Whisper service automatically; the first start downloads the model (~460 MB for `small.en`). `npm run whisper` runs it on its own. The assistant's spoken replies use Chrome's **Google UK English Female** voice at 1.12× speed (`VOICE_NAME` and `VOICE_RATE` in `customer-app/client/customer.jsx`), spoken a sentence at a time. Google's voices are synthesized online, so reply text (not guest audio) goes to Google. On browsers without it, another British female voice is used, then **Amy**, the local [Piper](https://github.com/OHF-Voice/piper1-gpl) voice from the Alice assistant, synthesized by the same service (`POST /api/tables/:t/speak`, cached, 30 replies per minute per table; the voice file, ~60 MB, downloads on first start). If Whisper isn't installed or stops responding, tablets fall back to the browser's built-in speech recognition and voice; if the VAD can't load, a simple loudness detector ends turns instead. The VAD's runtime files (`public/assets/vendor/ort`, `vad`, about 17 MB) are copied by `npm run build` and cached by tablets for a day.
+(On macOS/Linux the interpreter is `whisper-service/.venv/bin/python`.) After that, `npm start` launches the Whisper service automatically; the first start downloads the model (~460 MB for `small`). `npm run whisper` runs it on its own. The assistant's spoken replies use Chrome's **Google UK English Female** voice at 1.12× speed, or 0.9× when the guest picks a slower voice (`VOICE_NAME` and `VOICE_RATE` in `customer-app/client/customer.jsx`), spoken a sentence at a time; Hindi and Marathi use the browser's hi-IN or mr-IN voice. Google's voices are synthesized online, so reply text (not guest audio) goes to Google. On browsers without it, another British female voice is used, then **Amy**, the local [Piper](https://github.com/OHF-Voice/piper1-gpl) voice from the Alice assistant, synthesized by the same service (`POST /api/tables/:t/speak`, cached, 30 replies per minute per table; the voice file, ~60 MB, downloads on first start). If Whisper isn't installed or stops responding, tablets fall back to the browser's built-in speech recognition and voice; if the VAD can't load, a simple loudness detector ends turns instead. The VAD's runtime files (`public/assets/vendor/ort`, `vad`, about 17 MB) are copied by `npm run build` and cached by tablets for a day.
 
 ## How it fits together
 
@@ -88,7 +105,7 @@ customer tablet (/table/4) ──┐                ┌── restaurant dashboa
 The assistant pipeline runs on the server, so a guest can't bypass it from the browser:
 
 1. **Rate limit**: 6 commands per minute per table (HTTP 429 with `Retry-After`).
-2. **Speech safety parse**: control characters stripped and a 160-character cap, about 8 seconds of speech. The tablet also stops listening after 8 seconds.
+2. **Speech safety parse**: control characters stripped and a 240-character cap. The tablet stops listening after 12 seconds (18 when the guest chooses more time).
 3. **Input guardrail**: prompt injection, price manipulation and off-topic requests get a polite refusal and are logged.
 4. **Schema validation**: every tool call is checked against a strict schema. Any price field is stripped and logged.
 5. **Pricing engine**: totals come from the menu table only. The tablet never sends a price.

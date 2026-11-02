@@ -11,7 +11,7 @@ The schema, trigger, RLS policies and RPCs live in [`../supabase/migrations`](..
 
 ## Set up
 
-1. **Apply the migration** to your Supabase project. Either paste `supabase/migrations/20261031000000_restaurant_licensing.sql` into the SQL editor, or from `Project/`:
+1. **Apply the migrations** to your Supabase project, in order: `20261031000000_restaurant_licensing.sql`, then `20261102000000_soft_limits_and_billing.sql`. Either paste each file from `supabase/migrations/` into the SQL editor, or from `Project/`:
    ```sh
    npx supabase link --project-ref <ref>
    npx supabase db push
@@ -37,13 +37,16 @@ Then for each restaurant's Voice-assistant, set `SUPABASE_URL` and `SUPABASE_ANO
 - **Onboarding** (`/restaurants/new`): name, unique username, email, password (stored hashed by Supabase Auth; generated if blank), unique 6-digit staff PIN (generated or typed), plan, payment received, and rate limit. On approval it creates the Supabase Auth user and the restaurant, starts the plan if paid, and emails the login details and PIN. Without email configured, the details are shown once on screen.
 - **Dashboard** (`/`): every restaurant with name, username, staff PIN (click to reveal), plan and end date, payment toggle, service status, rate-limit status with a usage meter, and actions: Activate, Suspend, Extend plan, and under More: change the rate limit, issue a new staff PIN, reset the password. Filters for All, Active, Suspended and Flagged. Refreshes every 15 seconds.
 - **Payment and access**: marking a restaurant unpaid suspends it at once (database trigger); the Voice-assistant notices within 10 seconds or on the next voice request, whichever is first, and closes all staff sessions and tablets. Marking it paid restores service, and starts a new period if the plan had lapsed. Manual suspensions and abuse flags stay until you press Activate. Activate is refused while unpaid or expired.
-- **Abuse prevention**: every voice request calls `increment_usage`. When a restaurant reaches its limit within the hour (or day), it is flagged, access is revoked on that same request, and an alert appears at the top of the dashboard. Activating it again resets its counter and closes the alert.
+- **Voice limits and abuse**: every voice request calls `increment_usage`. At 80% of a restaurant's limit for the hour (or day) you get a warning alert; at 100% its voice is slowed down until the window resets (one voice turn per table every 20 seconds), while ordering by touch and its staff dashboard keep working, and the alert clears by itself. Only three times the limit in one window counts as abuse: the restaurant is flagged, access is revoked, and it stays off until you press Activate, which resets its counter.
+- **Payments (Razorpay)**: under More, **Send payment link** creates a Razorpay payment link for one period of the chosen plan, and Razorpay emails it to the restaurant. When it's paid, the webhook (`/admin/api/razorpay/webhook`) marks the restaurant paid and extends the plan by one period. Razorpay subscriptions work the same way if their notes carry `restaurant_id` and `plan`; a halted subscription marks the restaurant unpaid, and failed payments raise a Payment alert. Each webhook event is applied once, and only its id and type are stored, never the amount. Set the `RAZORPAY_*` values in `.env.local` and add the webhook in the Razorpay dashboard with the events listed in `.env.example`.
+- **Plan-end reminders**: restaurants are emailed 7 days and 1 day before their plan ends, with a payment link when Razorpay is set up. In production, `vercel.json` calls `/admin/api/cron/reminders` daily (set `CRON_SECRET`); elsewhere, call that URL daily with `Authorization: Bearer <CRON_SECRET>`, or press **Send due reminders** on the dashboard. Extending a plan re-arms both reminders.
 - **Privacy**: no revenue, order or sales data exists in this schema. Usage is stored as hourly request counts per type.
 
 ## Security notes
 
 - The service role key is read only in server code (`src/lib/supabaseAdmin.ts`, marked `server-only`). Every page and server action calls `requireAdmin()`, which checks `public.is_admin()` for the signed-in user.
 - Restaurants and admins share Supabase Auth; admin rights come only from the `admins` table, so a restaurant login can't open this app.
+- `/admin/api/razorpay/webhook` and `/admin/api/cron/reminders` are the only routes outside the admin sign-in. The webhook accepts only requests signed with `RAZORPAY_WEBHOOK_SECRET` (HMAC-SHA256); the cron route only `Bearer <CRON_SECRET>`. Both refuse everything while their secret is unset.
 - The Voice-assistant never holds the service role key. It acts as the restaurant's own user through security-definer RPCs that only see that restaurant's row, so it can't change its own payment status or limits.
 - `login_email(username)` is callable without signing in, so devices can connect with a username. It reveals a restaurant's email to anyone who knows its username.
 - Staff PINs are stored in plain text (the dashboard displays them), readable only by admins and by the restaurant's own signed-in device.

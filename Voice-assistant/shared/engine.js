@@ -4,11 +4,35 @@
 export const TAX_RATE = 0.08875;
 export const IDLE_LIMIT = 90;          // seconds of inactivity before a session resets
 export const WARN_AT = 30;             // seconds remaining when the "still there?" alert fires
-export const MAX_TURN_MS = 8000;       // max length of a single speech turn
-export const MAX_TURN_CHARS = 160;     // ~8s of speech at 150 wpm
+export const MAX_TURN_MS = 12000;      // max length of a single speech turn
+export const LONG_TURN_MS = 18000;     // ...when the guest picks "Take your time"
+export const MAX_TURN_CHARS = 240;     // ~18s of unhurried speech
 export const RATE_LIMIT = 6;           // voice commands...
 export const RATE_WINDOW = 60000;      // ...per minute per table session
+export const UNDO_MS = 60000;          // a guest can take an order back this long after sending it
 export const TABLES = ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'];
+
+// Allergens staff can mark on a dish. The assistant answers allergy questions only for dishes whose
+// list the kitchen has confirmed (item.allergensChecked); otherwise it fetches a member of staff.
+export const ALLERGENS = {
+  gluten: { label: 'Gluten', re: /\b(gluten|wheat|celiac|coeliac)\b/ },
+  dairy: { label: 'Dairy', re: /\b(dairy|milk|lactose)\b/ },
+  egg: { label: 'Egg', re: /\beggs?\b/ },
+  nuts: { label: 'Tree nuts', re: /\b(nuts?|tree nuts?|almonds?|cashews?|walnuts?|pistachios?|hazelnuts?|pecans?)\b/ },
+  peanuts: { label: 'Peanuts', re: /\b(peanuts?|groundnuts?)\b/ },
+  soy: { label: 'Soy', re: /\b(soy|soya)\b/ },
+  sesame: { label: 'Sesame', re: /\bsesame\b/ },
+  fish: { label: 'Fish', re: /\bfish\b/ },
+  shellfish: { label: 'Shellfish', re: /\b(shellfish|shrimps?|prawns?|crabs?|lobsters?|crustaceans?)\b/ },
+  molluscs: { label: 'Molluscs', re: /\b(molluscs?|mollusks?|squid|calamari|mussels?|clams?|oysters?|octopus)\b/ },
+  mustard: { label: 'Mustard', re: /\bmustard\b/ },
+  celery: { label: 'Celery', re: /\bcelery\b/ },
+  sulphites: { label: 'Sulphites', re: /\b(sulphites?|sulfites?)\b/ },
+  coconut: { label: 'Coconut', re: /\bcoconuts?\b/ },
+};
+export const ALLERGEN_KEYS = Object.keys(ALLERGENS);
+export const allergenLabel = (k) => (ALLERGENS[k] ? ALLERGENS[k].label : k);
+export const allergensIn = (t) => ALLERGEN_KEYS.filter((k) => ALLERGENS[k].re.test(t));
 
 export const fmt = (n) => '$' + (Math.round(n * 100) / 100).toFixed(2);
 
@@ -106,14 +130,28 @@ export function totals(menu, lines) {
   return { subtotal, tax, total: subtotal + tax };
 }
 
+// The dish the owner pairs with something already in the cart, if it isn't there yet.
+export function upsellFor(menu, cart) {
+  for (const l of cart) {
+    const base = menu.find((m) => m.id === l.itemId);
+    const pair = base && base.pairWith && menu.find((m) => m.id === base.pairWith);
+    if (pair && pair.available && !cart.some((x) => x.itemId === pair.id)) return { item: pair, base };
+  }
+  return null;
+}
+
 // ---------- Filters ----------
-export const EMPTY_FILTERS = { diet: null, vegan: false, gf: false, spice: null, meal: null, category: 'all', maxPrice: null };
+export const EMPTY_FILTERS = { diet: null, vegan: false, gf: false, jain: false, halal: false, avoid: [], spice: null, meal: null, category: 'all', maxPrice: null };
 export function matchesFilters(item, f) {
   if (f.category === 'specials' && !item.chefSpecial) return false;
   if (f.category !== 'all' && f.category !== 'specials' && item.category !== f.category) return false;
   if (f.diet && item.diet !== f.diet) return false;
   if (f.vegan && !item.vegan) return false;
   if (f.gf && !item.gf) return false;
+  if (f.jain && !item.jain) return false;
+  if (f.halal && !item.halal) return false;
+  // Only dishes whose allergen list the kitchen has confirmed can be shown as free of something.
+  if (f.avoid && f.avoid.length && (!item.allergensChecked || f.avoid.some((a) => item.allergens.includes(a)))) return false;
   if (f.spice === 'spicy' && item.spicy < 1) return false;
   if (f.spice === 'mild' && item.spicy > 0) return false;
   if (f.meal && !item.meals.includes(f.meal)) return false;
@@ -128,8 +166,14 @@ export function describeFilters(f) {
   else if (f.diet === 'veg') adj.push('vegetarian');
   if (f.diet === 'nonveg') adj.push('non-veg');
   if (f.gf) adj.push('gluten-free');
+  if (f.jain) adj.push('Jain');
+  if (f.halal) adj.push('halal');
   const noun = f.category === 'all' ? 'dishes' : f.category === 'specials' ? 'chef specials' : catLabel(f.category).toLowerCase() + (f.category === 'pizza' ? 's' : f.category === 'mains' ? 's' : '');
   let s = [...adj, noun].join(' ');
+  if (f.avoid && f.avoid.length) {
+    const names = f.avoid.map((a) => allergenLabel(a).toLowerCase());
+    s += ' without ' + (names.length < 2 ? names[0] : names.slice(0, -1).join(', ') + ' or ' + names[names.length - 1]);
+  }
   if (f.meal) s += ' for ' + f.meal;
   if (f.maxPrice) s += ' under ' + fmt(f.maxPrice).replace('.00', '');
   return s;
@@ -218,7 +262,18 @@ const RE = {
   recommend: /\b(recommend|suggest|what'?s good|popular|signature|favou?rite|surprise me)\b/,
   priceAttempt: /\$\s*\d+(\.\d+)?|\b\d+\s*(dollars|bucks)\b/,
   allergy: /\ballerg(?:y|ic|ies)\b(?: to)? ([a-z ]{3,30}?)(?=[,.;!?]|\s+(?:and|please|so|but|add)\b|$)/,
+  // "Does the korma have nuts?", "is the tiramisu nut-free", "any gluten in the penne"
+  allergenAsk: /\b(contains?|have|has|got|any|free|safe|allerg\w*|is there|are there)\b/,
+  cancelOrder: /\b(undo|cancel|take back)\b.{0,20}\b(order|that|it)\b|^undo\b/,
 };
+
+// Short answers to "Shall I send it?" and "Would you like to add …?".
+export function confirmWord(raw) {
+  const t = norm(raw).replace(/[.!]+$/, '');
+  if (/^(no|nope|not yet|wait|hold on|don'?t|no thanks?|no thank you|not now|cancel)\b/.test(t)) return 'no';
+  if (/^(yes|yeah|yep|yup|sure|ok|okay|please|please do|go ahead|confirm|correct|that'?s right|send|send it|do it|add it|yes please|of course|absolutely)\b/.test(t)) return 'yes';
+  return null;
+}
 
 export function extractFilters(t) {
   const f = { ...EMPTY_FILTERS };
@@ -227,6 +282,17 @@ export function extractFilters(t) {
   else if (/\b(vegetarian|veggie|veg)\b/.test(t)) { f.diet = 'veg'; found = true; }
   if (/\b(vegan|plant[- ]based)\b/.test(t)) { f.vegan = true; f.diet = 'veg'; found = true; }
   if (/\bgluten[- ]?free\b|\bceliac\b|\bcoeliac\b|\bno gluten\b/.test(t)) { f.gf = true; found = true; }
+  if (/\bjain\b/.test(t)) { f.jain = true; f.diet = 'veg'; found = true; }
+  if (/\bhalal\b/.test(t)) { f.halal = true; found = true; }
+  // "nut-free", "without dairy", "no sesame" (gluten is covered by the gluten-free filter above)
+  if (/\b(free|without|no|avoid|allerg\w*)\b/.test(t)) {
+    const avoid = allergensIn(t).filter((a) => a !== 'gluten');
+    if (avoid.length) {
+      f.avoid = avoid; found = true;
+      // "fish-free" named fish, which isn't a request for non-veg dishes.
+      if (f.diet === 'nonveg' && !/\bnon[- ]?veg|\bmeat\b|\b(chicken|beef|lamb|pork)\b/.test(t)) f.diet = null;
+    }
+  }
   if (/\b(not spicy|mild|no spice|not too hot)\b/.test(t)) { f.spice = 'mild'; found = true; }
   else if (/\b(spicy|hot|fiery|chil(l)?i|heat)\b/.test(t)) { f.spice = 'spicy'; found = true; }
   const meal = t.match(/\b(breakfast|brunch|lunch|dinner|supper)\b/);
@@ -258,14 +324,20 @@ export function parseIntent(raw, menu) {
     const n = sm ? wordNum(sm[1] || sm[2]) : /\bsplit\b/.test(t) ? 2 : 1;
     return [...calls, { tool: 'request_bill', args: { split_ways: n } }];
   }
+  const hits = findItems(t, menu);
+  if (RE.cancelOrder.test(t) && !hits.length) return [...calls, { tool: 'cancel_order', args: {} }];
   if (RE.placeOrder.test(t)) return [...calls, { tool: 'place_order', args: {} }];
-  if (RE.cart.test(t) && !findItems(t, menu).length) return [...calls, { tool: 'open_cart', args: {} }];
+  if (RE.cart.test(t) && !hits.length) return [...calls, { tool: 'open_cart', args: {} }];
   if (RE.clear.test(t)) return [...calls, { tool: 'clear_filters', args: {} }];
 
-  const hits = findItems(t, menu);
   if (hits.length) {
     if (RE.remove.test(t)) return [...calls, ...hits.map((h) => ({ tool: 'remove_from_cart', args: { item_id: h.item.id } }))];
-    if (RE.question.test(t) && !/\b(add|order|i'?ll have|get me)\b/.test(t)) return [...calls, { tool: 'describe_item', args: { item_id: hits[0].item.id } }];
+    const asked = allergensIn(t);
+    const ordering = /\b(add|order|i'?ll have|get me|i want|we want)\b/.test(t);
+    if (asked.length && !ordering && (RE.allergenAsk.test(t) || RE.question.test(t))) {
+      return [...calls.filter((c) => c.tool !== 'set_instructions'), { tool: 'allergen_check', args: { item_id: hits[0].item.id, allergen: asked[0] } }];
+    }
+    if (RE.question.test(t) && !ordering) return [...calls, { tool: 'describe_item', args: { item_id: hits[0].item.id } }];
     const priceAttempt = t.match(RE.priceAttempt);
     hits.forEach((h, i) => {
       const tail = t.slice(h.end, i + 1 < hits.length ? hits[i + 1].start : t.length);
@@ -292,12 +364,15 @@ const T = {
   num: (min, max) => (v) => (v === null || (typeof v === 'number' && v >= min && v <= max) ? null : `must be null or ${min}-${max}`),
   bool: (v) => (typeof v === 'boolean' ? null : 'must be boolean'),
   oneOf: (list) => (v) => (list.includes(v) ? null : `must be one of ${list.map(String).join(', ')}`),
+  listOf: (list, max) => (v) => (Array.isArray(v) && v.length <= max && v.every((x) => list.includes(x)) ? null : `must be a list of up to ${max} of ${list.join(', ')}`),
 };
 export const TOOL_SCHEMAS = {
   apply_filters: {
-    diet: T.oneOf([null, 'veg', 'nonveg']), vegan: T.bool, gf: T.bool, spice: T.oneOf([null, 'spicy', 'mild']),
-    meal: T.oneOf([null, ...MEALS]), category: T.oneOf(CATEGORIES.map((c) => c.id)), maxPrice: T.num(1, 500),
+    diet: T.oneOf([null, 'veg', 'nonveg']), vegan: T.bool, gf: T.bool, jain: T.bool, halal: T.bool, avoid: T.listOf(ALLERGEN_KEYS, 6),
+    spice: T.oneOf([null, 'spicy', 'mild']), meal: T.oneOf([null, ...MEALS]), category: T.oneOf(CATEGORIES.map((c) => c.id)), maxPrice: T.num(1, 500),
   },
+  allergen_check: { item_id: 'menu_item', allergen: T.oneOf(ALLERGEN_KEYS) },
+  cancel_order: {},
   clear_filters: {},
   add_to_cart: { item_id: 'menu_item', qty: T.int(1, 10), modifiers: 'modifier_list' },
   remove_from_cart: { item_id: 'menu_item' },

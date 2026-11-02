@@ -43,24 +43,29 @@ export function createWhisper(root) {
   setInterval(check, 15000).unref();
 
   // Piper (Alice's "Amy" voice) runs in the same service. Repeated lines such as greetings are cached.
-  const spoken = new Map(); // text -> wav
-  async function speak(text) {
-    const hit = spoken.get(text);
-    if (hit) { spoken.delete(text); spoken.set(text, hit); return hit; }
+  const spoken = new Map(); // rate + text -> wav
+  async function speak(text, rate = 'normal') {
+    const key = rate + '|' + text;
+    const hit = spoken.get(key);
+    if (hit) { spoken.delete(key); spoken.set(key, hit); return hit; }
     const r = await fetch(url + '/speak', {
-      method: 'POST', body: JSON.stringify({ text }), headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(15000),
+      method: 'POST', body: JSON.stringify({ text, rate }), headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(15000),
     });
     if (!r.ok) throw new Error('piper ' + r.status);
     const wav = Buffer.from(await r.arrayBuffer());
-    spoken.set(text, wav);
+    spoken.set(key, wav);
     if (spoken.size > 80) spoken.delete(spoken.keys().next().value);
     return wav;
   }
 
-  async function transcribe(pcm, prompt) {
-    const r = await fetch(`${url}/transcribe?prompt=${encodeURIComponent(prompt)}`, {
-      method: 'POST', body: pcm, headers: { 'Content-Type': 'application/octet-stream' }, signal: AbortSignal.timeout(20000),
+  // Non-English speech comes back translated to English (see whisper-service/server.py).
+  async function transcribe(pcm, prompt, lang = 'en') {
+    const r = await fetch(`${url}/transcribe?lang=${lang}&prompt=${encodeURIComponent(prompt)}`, {
+      method: 'POST', body: pcm, headers: { 'Content-Type': 'application/octet-stream' }, signal: AbortSignal.timeout(30000),
     });
+    if (r.status === 400 && (await r.clone().json().catch(() => ({}))).error === 'english_only') {
+      throw Object.assign(new Error('The Whisper model is English-only'), { code: 'english_only' });
+    }
     if (!r.ok) throw new Error('whisper ' + r.status);
     return r.json();
   }

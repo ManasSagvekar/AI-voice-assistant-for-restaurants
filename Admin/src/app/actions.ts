@@ -6,6 +6,8 @@ import { requireAdmin } from '@/lib/auth';
 import { supabaseAdmin } from '@/lib/supabaseAdmin';
 import { generatePassword, generatePin } from '@/lib/credentials';
 import { sendAccessEmail, type EmailOutcome } from '@/lib/email';
+import { createPaymentLink } from '@/lib/billing';
+import { sendDueReminders } from '@/lib/reminders';
 import { PLANS, RESTAURANT_COLUMNS as COLUMNS, type ActionResult, type Plan, type Restaurant } from '@/lib/types';
 
 const USERNAME = /^[a-z0-9][a-z0-9_.-]{2,39}$/;
@@ -99,7 +101,7 @@ export async function createRestaurant(_prev: CreateState, form: FormData): Prom
     if (extended) row = { ...row, ...(extended as Restaurant) };
   }
 
-  const mail: EmailOutcome = notify ? await sendAccessEmail('welcome', row, password) : { sent: false, reason: 'You chose not to send an email.' };
+  const mail: EmailOutcome = notify ? await sendAccessEmail('welcome', row, { password }) : { sent: false, reason: 'You chose not to send an email.' };
   if (mail.sent) await db.from('restaurants').update({ welcome_email_sent_at: new Date().toISOString() }).eq('id', row.id);
 
   revalidatePath('/');
@@ -179,7 +181,7 @@ export async function resetPassword(id: string) {
     const password = generatePassword();
     const { error } = await supabaseAdmin().auth.admin.updateUserById(uid, { password });
     if (error) return fail(error.message);
-    const mail = await sendAccessEmail('password', r, password);
+    const mail = await sendAccessEmail('password', r, { password });
     return mail.sent
       ? done(`New password emailed to ${r.email}.`)
       : done(`Password reset, but the email was not sent (${mail.reason}). Share it securely:`, password);
@@ -202,12 +204,35 @@ export async function regeneratePin(id: string) {
   });
 }
 
+// ---------- billing ----------
+// A Razorpay payment link for one period of the chosen plan. Razorpay emails it to the restaurant;
+// when it's paid, the webhook marks the restaurant paid and extends the plan.
+export async function sendPaymentLink(id: string, plan: Plan) {
+  return guard(async () => {
+    if (!isPlan(plan)) return fail('Choose a plan.');
+    const r = await load(id);
+    const link = await createPaymentLink(r, plan);
+    if ('error' in link) return fail(link.error);
+    return done(`Payment link sent to ${r.email} by Razorpay. When it's paid, ${r.name} is marked paid and extended automatically:`, link.url);
+  });
+}
+
+export async function runReminders() {
+  return guard(async () => {
+    const { sent, failed } = await sendDueReminders();
+    if (!sent.length && !failed.length) return done('No reminders are due. Restaurants are emailed 7 days and 1 day before their plan ends.');
+    if (failed.length && !sent.length) return fail(`No reminders could be sent: ${failed.join('; ')}`);
+    return done(`Reminders sent: ${sent.join(', ')}.${failed.length ? ` Not sent: ${failed.join('; ')}.` : ''}`);
+  });
+}
+
 // ---------- alerts ----------
 export async function dismissAlert(id: string) {
   return guard(async () => {
     if (!UUID.test(id)) return fail('Unknown alert.');
-    const { error } = await supabaseAdmin().from('admin_alerts').update({ resolved_at: new Date().toISOString() }).eq('id', id);
+    const db = supabaseAdmin();
+    const { data, error } = await db.from('admin_alerts').update({ resolved_at: new Date().toISOString() }).eq('id', id).select('kind').single();
     if (error) return fail(error.message);
-    return done('Alert dismissed. The restaurant stays flagged until you activate it.');
+    return done(data?.kind === 'abuse' ? 'Alert dismissed. The restaurant stays flagged until you activate it.' : 'Alert dismissed.');
   });
 }

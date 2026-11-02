@@ -6,14 +6,20 @@
 // also counted against the restaurant's rate limit. Only request counts leave this server: orders,
 // bills and totals stay in the local database.
 //
+// A paid restaurant is never stopped mid-service by its own internet: while Supabase can't be
+// reached, the last answer stands until the plan's end date. Going over the voice limit slows voice
+// down (see `usage`) instead of closing the restaurant; only a manual suspension, an unpaid or
+// expired plan, or an abuse flag closes it.
+//
 // Without SUPABASE_URL and SUPABASE_ANON_KEY it runs standalone, always active, with the local STAFF_PIN.
 import { createSupabase, SupabaseError } from './supabase.js';
 
 const POLL_MS = 10000;
+const OFFLINE_AFTER_MS = 45000; // no answer for this long counts as offline (shown to staff only)
 
-export function createLicense(store, { url, anonKey, name = 'Restaurant', graceMs = 15 * 60e3, onBlock = () => {} }) {
+export function createLicense(store, { url, anonKey, name = 'Restaurant', onBlock = () => {} }) {
   if (!url || !anonKey) {
-    const standalone = { state: 'standalone', active: true, linked: true, name };
+    const standalone = { state: 'standalone', active: true, linked: true, name, offline: false, usage: 'ok' };
     return { licensed: false, status: () => standalone, start() {}, useVoice: async () => ({ ok: true, status: standalone }) };
   }
 
@@ -41,15 +47,17 @@ export function createLicense(store, { url, anonKey, name = 'Restaurant', graceM
   }
 
   function status() {
-    if (!linked()) return { state: 'unlinked', active: false, linked: false, name };
-    if (!access) return { state: 'offline', active: false, linked: true, name };
-    // Use the last answer for a while if Supabase can't be reached, so a network blip doesn't stop
-    // dinner service; the plan's end date is still enforced locally.
-    const stale = Date.now() - access.checkedAt > graceMs;
+    if (!linked()) return { state: 'unlinked', active: false, linked: false, name, offline: false, usage: 'ok' };
+    if (!access) return { state: 'offline', active: false, linked: true, name, offline: true, usage: 'ok' };
+    // The last answer stands while Supabase can't be reached; the plan's end date is still enforced here.
+    const offline = Date.now() - access.checkedAt > OFFLINE_AFTER_MS;
     const expired = !access.subscription_expires_at || Date.parse(access.subscription_expires_at) <= Date.now();
-    const active = !!access.allowed && !expired && !stale;
-    const state = active ? 'active' : stale ? 'offline' : expired ? 'expired' : access.reason || 'suspended';
-    return { state, active, linked: true, name: access.name };
+    const active = !!access.allowed && !expired;
+    const state = active ? 'active' : expired ? 'expired' : access.reason || 'suspended';
+    // 'warn' from 80% of the voice limit, 'throttled' at the limit, for the rest of the window.
+    // Databases without the soft-limit migration don't send these, and simply report 'ok'.
+    const usage = access.throttled ? 'throttled' : access.warn ? 'warn' : 'ok';
+    return { state, active, linked: true, name: access.name, offline, usage, until: access.subscription_expires_at };
   }
   function notify() {
     const s = status();
@@ -79,7 +87,7 @@ export function createLicense(store, { url, anonKey, name = 'Restaurant', graceM
       if (a) setAccess(a); else unlink('the restaurant account no longer exists');
     } catch (e) {
       if (linked()) logError(e);
-      notify(); // the grace period may have just run out
+      notify(); // the plan may have just reached its end date
     }
   }
 
@@ -116,7 +124,7 @@ export function createLicense(store, { url, anonKey, name = 'Restaurant', graceM
     } catch (e) {
       logError(e);
       if (e instanceof SupabaseError && e.status >= 400 && e.status < 500) await check();
-      // Otherwise Supabase is unreachable: serve on the last known status within the grace period.
+      // Otherwise Supabase is unreachable: serve on the last known status.
     }
     const s = status();
     return { ok: s.active, status: s };

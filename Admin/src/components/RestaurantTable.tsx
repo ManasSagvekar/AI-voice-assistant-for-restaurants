@@ -1,6 +1,6 @@
 'use client';
 import { useState, useTransition } from 'react';
-import { activate, extendPlan, regeneratePin, resetPassword, setPayment, setRateLimit, suspend } from '@/app/actions';
+import { activate, extendPlan, regeneratePin, resetPassword, sendPaymentLink, setPayment, setRateLimit, suspend } from '@/app/actions';
 import { PLANS, planLabel, isDailyWindow, type ActionResult, type Plan, type RestaurantRow } from '@/lib/types';
 import { Badge, Switch } from './StatusBadge';
 
@@ -65,6 +65,7 @@ function Row({ r, onResult }: { r: RestaurantRow; onResult: (r: ActionResult) =>
   const daily = isDailyWindow(r.rate_limit_window);
   const [limit, setLimit] = useState(String(r.rate_limit_max));
   const [limitDaily, setLimitDaily] = useState(daily);
+  const [payPlan, setPayPlan] = useState<Plan>(r.subscription_plan);
   const run = (fn: () => Promise<ActionResult>, confirmText?: string) => {
     if (confirmText && !window.confirm(confirmText)) return;
     start(async () => onResult(await fn()));
@@ -103,10 +104,11 @@ function Row({ r, onResult }: { r: RestaurantRow; onResult: (r: ActionResult) =>
       </td>
       <td data-label="Service">
         <Badge tone={r.status === 'active' ? 'ok' : flagged ? 'danger' : 'warn'}>{r.status === 'active' ? 'Active' : 'Suspended'}</Badge>
-        <div className="sub">{flagged ? 'Revoked for abuse' : r.suspension_reason ? REASONS[r.suspension_reason] : ''}</div>
+        <div className="sub">{flagged ? 'Revoked: possible abuse' : r.suspension_reason ? REASONS[r.suspension_reason] : ''}</div>
       </td>
       <td data-label="Rate limit">
-        <Badge tone={flagged ? 'danger' : pct >= 80 ? 'warn' : 'neutral'}>{flagged ? 'Flagged' : pct >= 80 ? 'Near limit' : 'Normal'}</Badge>
+        {/* At the limit voice is only slowed down until the window resets; 3x the limit flags for abuse. */}
+        <Badge tone={flagged ? 'danger' : pct >= 80 ? 'warn' : 'neutral'}>{flagged ? 'Flagged' : pct >= 100 ? 'Voice slowed' : pct >= 80 ? 'Near limit' : 'Normal'}</Badge>
         <div className="meter" aria-hidden="true"><span style={{ width: `${pct}%` }} className={flagged || pct >= 80 ? 'hot' : ''} /></div>
         <div className="sub">{used.toLocaleString()} / {r.rate_limit_max.toLocaleString()} per {daily ? 'day' : 'hour'} · {r.requests_24h.toLocaleString()} in 24 h</div>
       </td>
@@ -137,6 +139,15 @@ function Row({ r, onResult }: { r: RestaurantRow; onResult: (r: ActionResult) =>
                   </div>
                 </label>
                 <button className="btn small" disabled={pending}>Save limit</button>
+              </form>
+              <form className="limit-form" onSubmit={(e) => { e.preventDefault(); run(() => sendPaymentLink(r.id, payPlan)); }}>
+                <label className="field compact">
+                  <span>Razorpay payment link</span>
+                  <select value={payPlan} onChange={(e) => setPayPlan(e.target.value as Plan)} aria-label="Plan to charge for">
+                    {PLANS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+                  </select>
+                </label>
+                <button className="btn small" disabled={pending}>Send payment link</button>
               </form>
               <button className="btn small" disabled={pending} onClick={() => run(() => regeneratePin(r.id), `Give ${r.name} a new staff PIN? The current PIN stops working for new sign-ins.`)}>New staff PIN</button>
               <button className="btn small" disabled={pending} onClick={() => run(() => resetPassword(r.id), `Reset ${r.name}'s password and email the new one?`)}>Reset password &amp; email</button>

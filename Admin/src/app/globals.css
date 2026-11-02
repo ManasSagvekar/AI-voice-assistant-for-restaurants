@@ -88,6 +88,10 @@ a { color: inherit; }
 .alerts li { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; background: var(--surface); border-radius: 8px; padding: 10px 12px; }
 .alerts li p { margin: 2px 0 0; }
 .alerts > p { margin: 10px 0 0; }
+.alerts-soft { background: var(--warn-bg); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+.alerts-soft h2 { color: var(--warn); }
+.tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.tools .notice { margin: 0; flex: 1; }
 
 /* ---------- controls ---------- */
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--line); background: var(--surface); color: var(--text); border-radius: 8px; padding: 8px 14px; font: inherit; font-weight: 550; cursor: pointer; text-decoration: none; white-space: nowrap; }

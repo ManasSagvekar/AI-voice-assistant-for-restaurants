@@ -3,14 +3,16 @@
 // updates pushed to both over Server-Sent Events.
 import http from 'node:http';
 import { readFile, mkdir } from 'node:fs/promises';
-import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createStore } from './store.js';
 import { createAssistant } from './assistant.js';
 import { createWhisper } from './whisper.js';
 import { createLicense } from './license.js';
-import { validateCall, CATEGORIES } from '../shared/engine.js';
+import { createBackups } from './backup.js';
+import { validateCall, CATEGORIES, ALLERGEN_KEYS, UNDO_MS } from '../shared/engine.js';
+import { isLang } from '../shared/i18n.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 try { process.loadEnvFile(path.join(ROOT, '.env')); } catch { /* no .env file; use the real environment */ }
@@ -28,6 +30,19 @@ const transcribeStamps = new Map(); // table -> timestamps, caps GPU work per ta
 const TRANSCRIBE_LIMIT = 12;
 const speakStamps = new Map(); // table -> timestamps for spoken replies
 const SPEAK_LIMIT = 30;
+// Over the restaurant's voice limit, each table gets one voice turn every SLOW_MS instead of being
+// cut off; ordering by touch and the staff dashboard are never limited.
+const SLOW_MS = 20000;
+const slowStamps = new Map(); // table -> last voice turn allowed while throttled
+const slowTickets = new Map(); // table -> a transcribed turn whose assistant call may follow
+function slowLane(table, { ticket = false } = {}) {
+  if (license.status().usage !== 'throttled') return 0;
+  if (ticket && Date.now() - (slowTickets.get(table) || 0) < 30000) { slowTickets.delete(table); return 0; }
+  const wait = (slowStamps.get(table) || 0) + SLOW_MS - Date.now();
+  if (wait > 0) return Math.ceil(wait / 1000);
+  slowStamps.set(table, Date.now());
+  return 0;
+}
 const tableList = (count) => Array.from({ length: count }, (_, i) => 'T' + (i + 1));
 const envTableCount = Number(process.env.TABLE_COUNT);
 const savedTableCount = Number(store.setting('table_count'));
@@ -41,7 +56,6 @@ store.setting('table_count', String(TABLE_COUNT));
 // Suspending, flagging or an unpaid plan closes every staff session and live screen at once.
 const license = createLicense(store, {
   url: process.env.SUPABASE_URL, anonKey: process.env.SUPABASE_ANON_KEY, name: process.env.RESTAURANT_NAME || 'Restaurant',
-  graceMs: (Number(process.env.LICENSE_GRACE_MINUTES) || 15) * 60e3,
   onBlock: (s) => {
     store.dropAllSessions();
     for (const c of clients) c.res.end();
@@ -70,12 +84,29 @@ const allowAttempt = (req) => {
   return true;
 };
 
+// ---------- backups ----------
+const backups = createBackups(store, {
+  dir: process.env.BACKUP_DIR || path.join(path.dirname(DB_FILE), 'backups'),
+  copyDir: process.env.BACKUP_COPY_DIR || '', keep: Number(process.env.BACKUP_KEEP) || 14,
+  hour: /^\d{1,2}$/.test(process.env.BACKUP_HOUR || '') ? Number(process.env.BACKUP_HOUR) : 3,
+});
+
+// ---------- tablet settings (staff dashboard) ----------
+// vad: 'normal', or 'noisy' for stricter speech detection and hold-to-talk in a loud room.
+// voicePrivacy: 'standard', or 'offline' to keep all speech on this computer (no Google voices and
+// no browser speech recognition).
+const tabletSettings = () => ({
+  vad: store.setting('tablet_vad') === 'noisy' ? 'noisy' : 'normal',
+  voicePrivacy: store.setting('voice_privacy') === 'offline' ? 'offline' : 'standard',
+});
+
 // ---------- live updates (SSE) ----------
 const clients = new Set();
 const tableSnapshot = (t) => ({ table: t, menu: store.menu(), cart: store.cart(t), note: store.note(t), orders: store.tableOrders(t), requests: store.requests(t), usage: assistant.usage(t), now: Date.now() });
 const adminSnapshot = () => ({
   tables: TABLES, menu: store.menu(), orders: store.recentOrders(), requests: store.requests(), security: store.security(),
-  occupancy: store.tableStatuses(TABLES),
+  occupancy: store.tableStatuses(TABLES), settings: tabletSettings(),
+  backup: backups.status(), allergenLog: store.allergenLog(), undoMs: UNDO_MS,
   carts: Object.fromEntries(TABLES.map((t) => [t, store.cart(t).reduce((s, l) => s + l.qty, 0)])), now: Date.now(),
 });
 let pending = null;
@@ -164,13 +195,24 @@ const CAT_IDS = CATEGORIES.map((c) => c.id).filter((c) => c !== 'all' && c !== '
 const MEALS = ['breakfast', 'lunch', 'dinner'];
 const str = (v, max, field) => (typeof v === 'string' && v.trim().length > 0 && v.length <= max ? v.trim() : bad(`${field} must be 1-${max} characters.`));
 const money = (v) => (typeof v === 'number' && isFinite(v) && v >= 0.5 && v <= 500 ? Math.round(v * 100) / 100 : bad('Price must be between $0.50 and $500.'));
-function itemPatch(body) {
+function itemPatch(body, itemId) {
   const p = {};
   if ('price' in body) p.price = money(body.price);
   if ('available' in body) p.available = body.available === true;
   if ('diet' in body) p.diet = ['veg', 'nonveg'].includes(body.diet) ? body.diet : bad('Diet must be veg or nonveg.');
-  for (const k of ['vegan', 'gf', 'chefSpecial']) if (k in body) p[k] = body[k] === true;
+  for (const k of ['vegan', 'gf', 'chefSpecial', 'jain', 'halal', 'allergensChecked']) if (k in body) p[k] = body[k] === true;
   if ('spicy' in body) p.spicy = [0, 1, 2, 3].includes(body.spicy) ? body.spicy : bad('Spice level must be 0-3.');
+  if ('allergens' in body) {
+    p.allergens = Array.isArray(body.allergens) && body.allergens.every((a) => ALLERGEN_KEYS.includes(a)) ? [...new Set(body.allergens)] : bad('Unknown allergen.');
+  }
+  // The dish the assistant suggests once alongside this one, chosen by the owner.
+  if ('pairWith' in body) {
+    p.pairWith = body.pairWith === null ? null
+      : typeof body.pairWith === 'string' && body.pairWith !== itemId && store.item(body.pairWith) ? body.pairWith : bad('Pick another dish from the menu.');
+  }
+  for (const [k, label] of [['nameHi', 'Hindi name'], ['nameMr', 'Marathi name']]) {
+    if (k in body) p[k] = typeof body[k] === 'string' && body[k].length <= 80 ? body[k].trim() : bad(`${label} must be up to 80 characters.`);
+  }
   if (!Object.keys(p).length) bad('Nothing to update.');
   return p;
 }
@@ -181,7 +223,8 @@ function newItem(r) {
     diet: r.diet === 'nonveg' ? 'nonveg' : 'veg', vegan: r.vegan === true && r.diet !== 'nonveg', gf: r.gf === true,
     spicy: [0, 1, 2, 3].includes(r.spicy) ? r.spicy : 0,
     meals: Array.isArray(r.meals) && r.meals.length && r.meals.every((m) => MEALS.includes(m)) ? [...new Set(r.meals)] : bad('Pick at least one meal time.'),
-    allergens: Array.isArray(r.allergens) ? r.allergens.filter((a) => typeof a === 'string').map((a) => a.slice(0, 30)).slice(0, 12) : [],
+    // Inferred from the menu text, so the kitchen still has to confirm them in Menu Control.
+    allergens: Array.isArray(r.allergens) ? [...new Set(r.allergens.filter((a) => ALLERGEN_KEYS.includes(a)))] : [], allergensChecked: false,
   };
 }
 const fmtMoney = (n) => '$' + n.toFixed(2);
@@ -198,13 +241,15 @@ async function route(req, res) {
   if (method === 'GET' && (r = p.match(/^\/table\/(\d{1,2})\/?$/))) {
     const table = 'T' + Number(r[1]);
     if (!TABLES.includes(table)) return serveFile(res, CUSTOMER_PUBLIC, 'index.html');
+    // Guests pick a table on the landing page, so an occupied one sends them back.
     if (store.tableStatuses([table])[table]) {
       res.writeHead(303, { Location: '/', 'Cache-Control': 'no-store' });
       return res.end();
     }
     return serveFile(res, CUSTOMER_PUBLIC, 'table.html');
   }
-  if (method === 'GET' && (p === '/restaurant' || p === '/restaurant/')) return serveFile(res, STAFF_PUBLIC, 'admin.html');
+  // One staff app, three views: the dashboard, a kitchen screen and a phone view for the floor.
+  if (method === 'GET' && /^\/(restaurant|kitchen|floor)\/?$/.test(p)) return serveFile(res, STAFF_PUBLIC, 'admin.html');
   // The dashboard used to live at /admin; that name now belongs to the super-admin app.
   if (method === 'GET' && (p === '/admin' || p === '/admin/')) { res.writeHead(302, { Location: '/restaurant' }); return res.end(); }
   // Vendored runtimes (React, ONNX wasm, the VAD model) only change on upgrade, so tablets may keep them a day.
@@ -214,13 +259,17 @@ async function route(req, res) {
     const occupancy = store.tableStatuses(TABLES);
     return send(res, 200, {
       tables: TABLES, busy: s.active ? TABLES.filter((t) => occupancy[t]) : [],
-      restaurant: s.name, service: { state: s.state, active: s.active, linked: s.linked },
+      restaurant: s.name, service: { state: s.state, active: s.active, linked: s.linked, offline: s.offline, usage: s.usage },
     });
   }
   if (method === 'GET' && p === '/api/voice') {
     const w = whisper.status();
+    const set = tabletSettings();
     const tts = w && w.voice ? { tts: 'piper', voice: w.voice } : { tts: 'browser' };
-    return send(res, 200, w ? { engine: 'whisper', model: w.model, device: w.device, ...tts } : { engine: 'browser', ...tts });
+    const common = { vad: set.vad, offlineOnly: set.voicePrivacy === 'offline', ...tts };
+    return send(res, 200, w
+      ? { engine: 'whisper', model: w.model, device: w.device, languages: w.languages || ['en'], ...common }
+      : { engine: 'browser', languages: ['en'], ...common });
   }
 
   if (method !== 'GET' && !sameOrigin(req)) return send(res, 403, { error: 'Cross-site request refused.' });
@@ -243,6 +292,7 @@ async function route(req, res) {
         : "Can't reach the licence server. Check the internet connection and try again." });
     }
   }
+
   const service = license.status();
   if (!service.active && (p.startsWith('/api/tables/') || p.startsWith('/api/admin/'))) return suspended(res, service);
 
@@ -260,17 +310,23 @@ async function route(req, res) {
         const retryAfter = Math.ceil((recent[0] + 60000 - now) / 1000);
         return send(res, 429, { error: 'rate_limited', retryAfter }, { 'Retry-After': String(retryAfter) });
       }
-      const pcm = await readAudio(req, 10 * 16000 * 2); // 10 s cap; the tablet stops at 8 s
+      const pcm = await readAudio(req, 20 * 16000 * 2); // 20 s cap; the tablet stops at 12 s (18 s when the guest takes their time)
       if (!whisper.status()) return send(res, 503, { error: 'Voice transcription is offline.' });
+      const lang = url.searchParams.get('lang') || 'en';
+      if (!isLang(lang)) bad('Unknown language.');
+      const wait = slowLane(table);
+      if (wait) return send(res, 429, { error: 'voice_busy', retryAfter: wait }, { 'Retry-After': String(wait) });
       const gate = await license.useVoice('transcribe');
       if (!gate.ok) return suspended(res, gate.status);
       recent.push(now); transcribeStamps.set(table, recent);
       // Dish names steer Whisper toward the menu's spelling ("burrata", "arrabbiata", "tiramisu").
       const prompt = 'Restaurant order. Menu: ' + store.menu().filter((m) => m.available).map((m) => m.name).join(', ') + '.';
       try {
-        const out = await whisper.transcribe(pcm, prompt);
+        const out = await whisper.transcribe(pcm, prompt, lang);
+        if (license.status().usage === 'throttled') slowTickets.set(table, Date.now());
         return send(res, 200, { text: out.text, ms: out.ms });
       } catch (e) {
+        if (e.code === 'english_only') return send(res, 409, { error: 'language_unavailable' });
         console.error('[whisper]', e.message);
         return send(res, 503, { error: 'Voice transcription is offline.' });
       }
@@ -291,13 +347,18 @@ async function route(req, res) {
       store.setNote(table, typeof body.note === 'string' ? body.note.slice(0, 200) : '');
     } else if (method === 'POST' && sub === '/reset') {
       store.resetTable(table);
+      assistant.forget(table);
     } else if (method === 'POST' && sub === '/orders') {
       const orderId = store.placeOrder(table);
       if (!orderId) return send(res, 409, { error: 'Your order is empty.' });
+      assistant.forget(table);
       broadcast();
-      return send(res, 201, { orderId });
+      return send(res, 201, { orderId, undoUntil: Date.now() + UNDO_MS });
+    } else if (method === 'POST' && (r = sub.match(/^\/orders\/([\w-]+)\/cancel$/))) {
+      const out = store.cancelOrder(table, r[1], UNDO_MS);
+      if (!out.ok) return send(res, 409, { error: out.reason === 'too_late' ? 'The kitchen has already started this order. Please ask your server.' : 'Order not found.' });
     } else if (method === 'POST' && sub === '/requests') {
-      if (body.type === 'server') store.addRequest(table, 'server', 'Call Server button');
+      if (body.type === 'server') store.addRequest(table, 'server', typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim().slice(0, 120) : 'Call Server button');
       else if (body.type === 'bill') {
         const split = Number.isInteger(body.split) && body.split >= 1 && body.split <= 12 ? body.split : bad('Split must be 1-12.');
         const total = store.tableOrders(table).reduce((s, o) => s + o.total, 0);
@@ -309,7 +370,8 @@ async function route(req, res) {
       const text = typeof body.text === 'string' ? body.text.trim().slice(0, 400) : '';
       if (!text) bad('Nothing to say.');
       const w = whisper.status();
-      if (!w || !w.voice) return send(res, 503, { error: 'The assistant voice is offline.' });
+      // The local voice speaks English only; over the voice limit the tablet uses its own voice.
+      if (!w || !w.voice || (body.lang && body.lang !== 'en') || license.status().usage === 'throttled') return send(res, 503, { error: 'The assistant voice is offline.' });
       const now = Date.now();
       const recent = (speakStamps.get(table) || []).filter((t) => now - t < 60000);
       if (recent.length >= SPEAK_LIMIT) return send(res, 429, { error: 'rate_limited' });
@@ -317,7 +379,7 @@ async function route(req, res) {
       if (!gate.ok) return suspended(res, gate.status);
       recent.push(now); speakStamps.set(table, recent);
       try {
-        const wav = await whisper.speak(text);
+        const wav = await whisper.speak(text, body.rate === 'slow' ? 'slow' : 'normal');
         res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store', ...SECURITY_HEADERS });
         return res.end(wav);
       } catch (e) {
@@ -325,9 +387,12 @@ async function route(req, res) {
         return send(res, 503, { error: 'The assistant voice is offline.' });
       }
     } else if (method === 'POST' && sub === '/assistant') {
+      const lang = isLang(body.lang) ? body.lang : 'en';
+      const wait = slowLane(table, { ticket: true });
+      if (wait) return send(res, 429, { error: 'voice_busy', retryAfter: wait }, { 'Retry-After': String(wait) });
       const gate = await license.useVoice('assistant');
       if (!gate.ok) return suspended(res, gate.status);
-      const out = assistant.handle(table, typeof body.text === 'string' ? body.text.slice(0, 1000) : '');
+      const out = assistant.handle(table, typeof body.text === 'string' ? body.text.slice(0, 1000) : '', lang);
       broadcast();
       return send(res, out.status, out.body, out.status === 429 ? { 'Retry-After': String(out.body.retryAfter) } : {});
     } else return send(res, 404, { error: 'Not found' });
@@ -361,7 +426,7 @@ async function route(req, res) {
     }
     const body = method === 'GET' ? {} : await readJson(req);
     if (method === 'PATCH' && (r = sub.match(/^\/menu\/([\w-]+)$/))) {
-      if (!store.updateItem(r[1], itemPatch(body))) return send(res, 404, { error: 'Dish not found.' });
+      if (!store.updateItem(r[1], itemPatch(body, r[1]))) return send(res, 404, { error: 'Dish not found.' });
     } else if (method === 'POST' && sub === '/menu') {
       if (!Array.isArray(body.items) || !body.items.length || body.items.length > 60) bad('Send 1-60 dishes.');
       const added = store.publishItems(body.items.map(newItem));
@@ -371,6 +436,12 @@ async function route(req, res) {
       if (!TABLES.includes(r[1])) return send(res, 404, { error: 'Unknown table.' });
       if (typeof body.occupied !== 'boolean') bad('occupied must be a boolean.');
       store.setTableOccupied(r[1], body.occupied);
+    } else if (method === 'PATCH' && sub === '/settings/tablets') {
+      if ('vad' in body) store.setting('tablet_vad', ['normal', 'noisy'].includes(body.vad) ? body.vad : bad('Unknown microphone setting.'));
+      if ('voicePrivacy' in body) store.setting('voice_privacy', ['standard', 'offline'].includes(body.voicePrivacy) ? body.voicePrivacy : bad('Unknown voice setting.'));
+    } else if (method === 'POST' && sub === '/backup') {
+      const out = backups.run();
+      if (out.error) return send(res, 500, { error: `Backup failed: ${out.error}` });
     } else if (method === 'PATCH' && sub === '/settings/table-count') {
       if (!Number.isInteger(body.count) || body.count < 1 || body.count > 99) bad('Table count must be an integer from 1 to 99.');
       TABLE_COUNT = body.count;
@@ -403,6 +474,8 @@ server.listen(PORT, () => {
   console.log(`  Restaurant staff:  ${PUBLIC_URL}/restaurant`);
   console.log(`  Database:          ${DB_FILE}`);
   console.log(`  Licence:           ${license.licensed ? license.status().state : 'standalone (no SUPABASE_URL)'}`);
+  console.log(`  Backups:           ${backups.status().dir}${process.env.BACKUP_COPY_DIR ? ' + ' + process.env.BACKUP_COPY_DIR : ''}`);
   license.start();
+  backups.start();
   whisper.start();
 });
