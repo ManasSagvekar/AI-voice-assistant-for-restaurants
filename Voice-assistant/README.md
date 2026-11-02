@@ -1,4 +1,4 @@
-# Flavoria AI Table Assistant
+# AI Voice-Assistant for Restaurants
 
 Two apps that share one live database:
 
