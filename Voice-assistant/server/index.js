@@ -1,5 +1,5 @@
 // Shared backend for the two Tazte apps: the customer tablet app (customer-app/, served at /table/:n)
-// and the staff dashboard (staff-app/, served at /admin). One process, one SQLite database, with live
+// and the staff dashboard (staff-app/, served at /restaurant). One process, one SQLite database, with live
 // updates pushed to both over Server-Sent Events.
 import http from 'node:http';
 import { readFile, mkdir } from 'node:fs/promises';
@@ -9,11 +9,14 @@ import { fileURLToPath } from 'node:url';
 import { createStore } from './store.js';
 import { createAssistant } from './assistant.js';
 import { createWhisper } from './whisper.js';
+import { createLicense } from './license.js';
 import { validateCall, CATEGORIES } from '../shared/engine.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 try { process.loadEnvFile(path.join(ROOT, '.env')); } catch { /* no .env file; use the real environment */ }
 const PORT = Number(process.env.PORT) || 3000;
+// Where people reach this server, if that differs from PORT (e.g. behind the root `npm run dev` proxy).
+const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
 const DB_FILE = process.env.DB_FILE || path.join(ROOT, 'data', 'flavoria.db');
 const SESSION_TTL = 12 * 3600e3;
 
@@ -34,16 +37,38 @@ let TABLE_COUNT = Number.isInteger(savedTableCount) && savedTableCount >= 1 && s
 let TABLES = tableList(TABLE_COUNT);
 store.setting('table_count', String(TABLE_COUNT));
 
+// ---------- restaurant licence (admin app) ----------
+// Suspending, flagging or an unpaid plan closes every staff session and live screen at once.
+const license = createLicense(store, {
+  url: process.env.SUPABASE_URL, anonKey: process.env.SUPABASE_ANON_KEY, name: process.env.RESTAURANT_NAME || 'Restaurant',
+  graceMs: (Number(process.env.LICENSE_GRACE_MINUTES) || 15) * 60e3,
+  onBlock: (s) => {
+    store.dropAllSessions();
+    for (const c of clients) c.res.end();
+    clients.clear();
+    console.log(`[license] Service ${s.state}: staff sessions and live screens closed.`);
+  },
+});
+const suspended = (res, s) => send(res, 403, { error: 'service_suspended', state: s.state });
+
 // ---------- staff PIN ----------
+// Licensed: the 6-digit PIN set in the admin app, checked by Supabase. Standalone: STAFF_PIN.
 const sha = (s) => createHash('sha256').update(String(s)).digest('hex');
 const staffPin = process.env.STAFF_PIN ?? '1801';
 let pinHash = sha(staffPin);
 store.setting('staff_pin_hash', pinHash);
-if (!process.env.STAFF_PIN) {
+if (!license.licensed && !process.env.STAFF_PIN) {
   console.log(`\n  Using default staff PIN: ${staffPin}  (set STAFF_PIN to choose your own)\n`);
 }
 const pinOk = (pin) => timingSafeEqual(Buffer.from(sha(pin), 'hex'), Buffer.from(pinHash, 'hex'));
 const loginAttempts = new Map(); // ip -> timestamps
+const allowAttempt = (req) => {
+  const ip = req.socket.remoteAddress;
+  const recent = (loginAttempts.get(ip) || []).filter((t) => Date.now() - t < 60000);
+  if (recent.length >= 5) return false;
+  recent.push(Date.now()); loginAttempts.set(ip, recent);
+  return true;
+};
 
 // ---------- live updates (SSE) ----------
 const clients = new Set();
@@ -170,11 +195,28 @@ async function route(req, res) {
 
   // pages
   if (method === 'GET' && p === '/') return serveFile(res, CUSTOMER_PUBLIC, 'index.html');
-  if (method === 'GET' && (r = p.match(/^\/table\/(\d{1,2})\/?$/))) return serveFile(res, CUSTOMER_PUBLIC, TABLES.includes('T' + Number(r[1])) ? 'table.html' : 'index.html');
-  if (method === 'GET' && (p === '/admin' || p === '/admin/')) return serveFile(res, STAFF_PUBLIC, 'admin.html');
+  if (method === 'GET' && (r = p.match(/^\/table\/(\d{1,2})\/?$/))) {
+    const table = 'T' + Number(r[1]);
+    if (!TABLES.includes(table)) return serveFile(res, CUSTOMER_PUBLIC, 'index.html');
+    if (store.tableStatuses([table])[table]) {
+      res.writeHead(303, { Location: '/', 'Cache-Control': 'no-store' });
+      return res.end();
+    }
+    return serveFile(res, CUSTOMER_PUBLIC, 'table.html');
+  }
+  if (method === 'GET' && (p === '/restaurant' || p === '/restaurant/')) return serveFile(res, STAFF_PUBLIC, 'admin.html');
+  // The dashboard used to live at /admin; that name now belongs to the super-admin app.
+  if (method === 'GET' && (p === '/admin' || p === '/admin/')) { res.writeHead(302, { Location: '/restaurant' }); return res.end(); }
   // Vendored runtimes (React, ONNX wasm, the VAD model) only change on upgrade, so tablets may keep them a day.
   if (method === 'GET' && p.startsWith('/assets/')) return serveFile(res, ASSETS, p.slice('/assets/'.length), p.startsWith('/assets/vendor/') ? 'public, max-age=86400' : 'public, max-age=300');
-  if (method === 'GET' && p === '/api/config') return send(res, 200, { tables: TABLES });
+  if (method === 'GET' && p === '/api/config') {
+    const s = license.status();
+    const occupancy = store.tableStatuses(TABLES);
+    return send(res, 200, {
+      tables: TABLES, busy: s.active ? TABLES.filter((t) => occupancy[t]) : [],
+      restaurant: s.name, service: { state: s.state, active: s.active, linked: s.linked },
+    });
+  }
   if (method === 'GET' && p === '/api/voice') {
     const w = whisper.status();
     const tts = w && w.voice ? { tts: 'piper', voice: w.voice } : { tts: 'browser' };
@@ -182,6 +224,27 @@ async function route(req, res) {
   }
 
   if (method !== 'GET' && !sameOrigin(req)) return send(res, 403, { error: 'Cross-site request refused.' });
+
+  // Connect this server to its restaurant account, once, with the credentials from the welcome email.
+  if (p === '/api/admin/connect' && method === 'POST') {
+    if (!license.licensed || license.status().linked) return send(res, 409, { error: 'This system is already connected.' });
+    if (!allowAttempt(req)) return send(res, 429, { error: 'Too many attempts. Wait a minute and try again.' });
+    const body = await readJson(req);
+    if (typeof body.username !== 'string' || typeof body.password !== 'string' || !body.username || !body.password) bad('Enter the restaurant username and password.');
+    try {
+      const s = await license.link(body.username.slice(0, 64), body.password.slice(0, 200));
+      loginAttempts.delete(req.socket.remoteAddress);
+      return send(res, 200, { service: { state: s.state, active: s.active, linked: s.linked }, restaurant: s.name });
+    } catch (e) {
+      if (e.userFacing) return send(res, e.status, { error: e.message });
+      console.error('[license]', e.message);
+      return send(res, 503, { error: e.status
+        ? 'The licence server refused this system. Check SUPABASE_URL and SUPABASE_ANON_KEY in its .env.'
+        : "Can't reach the licence server. Check the internet connection and try again." });
+    }
+  }
+  const service = license.status();
+  if (!service.active && (p.startsWith('/api/tables/') || p.startsWith('/api/admin/'))) return suspended(res, service);
 
   // ----- customer (table) API -----
   if ((r = p.match(/^\/api\/tables\/(T\d{1,2})(\/.*)?$/))) {
@@ -199,6 +262,8 @@ async function route(req, res) {
       }
       const pcm = await readAudio(req, 10 * 16000 * 2); // 10 s cap; the tablet stops at 8 s
       if (!whisper.status()) return send(res, 503, { error: 'Voice transcription is offline.' });
+      const gate = await license.useVoice('transcribe');
+      if (!gate.ok) return suspended(res, gate.status);
       recent.push(now); transcribeStamps.set(table, recent);
       // Dish names steer Whisper toward the menu's spelling ("burrata", "arrabbiata", "tiramisu").
       const prompt = 'Restaurant order. Menu: ' + store.menu().filter((m) => m.available).map((m) => m.name).join(', ') + '.';
@@ -217,8 +282,6 @@ async function route(req, res) {
       if (!v.ok || v.stripped.length) bad(v.errors[0] || 'That option is not available for this dish.');
       if (!store.item(v.args.item_id).available) return send(res, 409, { error: 'That dish is unavailable tonight.' });
       store.addToCart(table, v.args.item_id, v.args.qty, v.args.modifiers);
-    } else if (method === 'POST' && sub === '/occupancy') {
-      store.setTableOccupied(table, true);
     } else if (method === 'PATCH' && (r = sub.match(/^\/cart\/([\w-]+)$/))) {
       if (![-1, 1].includes(body.delta)) bad('delta must be 1 or -1.');
       if (!store.changeQty(table, r[1], body.delta)) return send(res, 404, { error: 'Line not found.' });
@@ -250,6 +313,8 @@ async function route(req, res) {
       const now = Date.now();
       const recent = (speakStamps.get(table) || []).filter((t) => now - t < 60000);
       if (recent.length >= SPEAK_LIMIT) return send(res, 429, { error: 'rate_limited' });
+      const gate = await license.useVoice('speak');
+      if (!gate.ok) return suspended(res, gate.status);
       recent.push(now); speakStamps.set(table, recent);
       try {
         const wav = await whisper.speak(text);
@@ -260,6 +325,8 @@ async function route(req, res) {
         return send(res, 503, { error: 'The assistant voice is offline.' });
       }
     } else if (method === 'POST' && sub === '/assistant') {
+      const gate = await license.useVoice('assistant');
+      if (!gate.ok) return suspended(res, gate.status);
       const out = assistant.handle(table, typeof body.text === 'string' ? body.text.slice(0, 1000) : '');
       broadcast();
       return send(res, out.status, out.body, out.status === 429 ? { 'Retry-After': String(out.body.retryAfter) } : {});
@@ -270,13 +337,15 @@ async function route(req, res) {
 
   // ----- staff (admin) API -----
   if (p === '/api/admin/login' && method === 'POST') {
-    const ip = req.socket.remoteAddress;
-    const recent = (loginAttempts.get(ip) || []).filter((t) => Date.now() - t < 60000);
-    if (recent.length >= 5) return send(res, 429, { error: 'Too many attempts. Wait a minute and try again.' });
-    recent.push(Date.now()); loginAttempts.set(ip, recent);
+    if (!allowAttempt(req)) return send(res, 429, { error: 'Too many attempts. Wait a minute and try again.' });
     const body = await readJson(req);
-    if (typeof body.pin !== 'string' || !pinOk(body.pin)) return send(res, 401, { error: 'That PIN is not correct.' });
-    loginAttempts.delete(ip);
+    let ok;
+    try { ok = typeof body.pin === 'string' && (license.licensed ? await license.verifyPin(body.pin) : pinOk(body.pin)); } catch (e) {
+      console.error('[license]', e.message);
+      return send(res, 503, { error: "Can't reach the licence server. Check the internet connection and try again." });
+    }
+    if (!ok) return send(res, 401, { error: 'That PIN is not correct.' });
+    loginAttempts.delete(req.socket.remoteAddress);
     const token = randomBytes(32).toString('base64url');
     store.addSession(sha(token), SESSION_TTL);
     return send(res, 200, { ok: true }, { 'Set-Cookie': `flv_staff=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL / 1000}${secureCookie(req)}` });
@@ -298,13 +367,17 @@ async function route(req, res) {
       const added = store.publishItems(body.items.map(newItem));
       broadcast();
       return send(res, 201, { added: added.length });
-      } else if (method === 'PATCH' && sub === '/settings/table-count') {
-        if (!Number.isInteger(body.count) || body.count < 1 || body.count > 99) bad('Table count must be an integer from 1 to 99.');
-        TABLE_COUNT = body.count;
-        TABLES = tableList(TABLE_COUNT);
-        store.setting('table_count', String(TABLE_COUNT));
-        broadcast();
-        return send(res, 200, { tables: TABLES });
+    } else if (method === 'PATCH' && (r = sub.match(/^\/tables\/(T\d{1,2})\/occupancy$/))) {
+      if (!TABLES.includes(r[1])) return send(res, 404, { error: 'Unknown table.' });
+      if (typeof body.occupied !== 'boolean') bad('occupied must be a boolean.');
+      store.setTableOccupied(r[1], body.occupied);
+    } else if (method === 'PATCH' && sub === '/settings/table-count') {
+      if (!Number.isInteger(body.count) || body.count < 1 || body.count > 99) bad('Table count must be an integer from 1 to 99.');
+      TABLE_COUNT = body.count;
+      TABLES = tableList(TABLE_COUNT);
+      store.setting('table_count', String(TABLE_COUNT));
+      broadcast();
+      return send(res, 200, { tables: TABLES });
     } else if (method === 'POST' && (r = sub.match(/^\/orders\/([\w-]+)\/advance$/))) {
       if (!store.advanceOrder(r[1])) return send(res, 404, { error: 'Order not found.' });
     } else if (method === 'POST' && (r = sub.match(/^\/requests\/([\w-]+)$/))) {
@@ -326,8 +399,10 @@ export const server = http.createServer(async (req, res) => {
 });
 server.listen(PORT, () => {
   console.log('Flavoria is running');
-  console.log(`  Customer tablets:  http://localhost:${PORT}/table/1 ... /table/${TABLE_COUNT}`);
-  console.log(`  Restaurant admin:  http://localhost:${PORT}/admin`);
+  console.log(`  Customer tablets:  ${PUBLIC_URL}/table/1 ... /table/${TABLE_COUNT}`);
+  console.log(`  Restaurant staff:  ${PUBLIC_URL}/restaurant`);
   console.log(`  Database:          ${DB_FILE}`);
+  console.log(`  Licence:           ${license.licensed ? license.status().state : 'standalone (no SUPABASE_URL)'}`);
+  license.start();
   whisper.start();
 });

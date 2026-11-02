@@ -5,6 +5,7 @@ import {
 import {
   useState, useEffect, useRef, useMemo, useCallback, tableName, mmss, modsText, Icon, Chili, DietMark, DishImage, Waveform,
   VOICE_LABEL, Toasts, StatusPill, api, useLive, useToasts, Brand, LiveBadge, Loading,
+  useContext, RestaurantContext, useRestaurant, ServicePaused, serviceChanged,
 } from '../../client/ui.jsx';
 
 const SAMPLE_PHRASES = [
@@ -23,7 +24,25 @@ function timeGreeting() {
   if (h < 17) return 'Good afternoon';
   return 'Good evening';
 }
-const greetingLine = () => `${timeGreeting()}. Ask me for recommendations, tell me what to add, or tap the mic and speak.`;
+// Assistant voice: Chrome's "Google UK English Female" at a natural conversational pace. Without it,
+// another British female voice; failing that, the restaurant's Piper voice, then the browser default.
+const VOICE_NAME = 'Google UK English Female';
+const VOICE_RATE = 1.12;
+const hasTts = () => typeof speechSynthesis !== 'undefined';
+function preferredVoice() {
+  if (!hasTts()) return null;
+  const gb = speechSynthesis.getVoices().filter((v) => /^en[-_]GB$/i.test(v.lang));
+  return gb.find((v) => v.name === VOICE_NAME)
+    || gb.find((v) => /female|libby|sonia|hazel|susan|serena|kate|martha|maisie|mia/i.test(v.name))
+    || gb.find((v) => !/\bmale\b|george|ryan|thomas|oliver|daniel|arthur|alfie/i.test(v.name))
+    || null;
+}
+// Chrome fills the voice list asynchronously.
+const voicesLoaded = new Promise((resolve) => {
+  if (!hasTts() || speechSynthesis.getVoices().length) return resolve();
+  speechSynthesis.addEventListener('voiceschanged', resolve, { once: true });
+  setTimeout(resolve, 1500);
+});
 
 // VAD callbacks while no turn is listening.
 const VAD_IDLE = { start() {}, misfire() {}, end() {} };
@@ -56,12 +75,23 @@ function primeMic() {
   );
 }
 
+// Remounting the tablet when service resumes reopens its live connection.
 function TableApp() {
+  const cfg = useRestaurant();
+  return (
+    <RestaurantContext.Provider value={cfg || { restaurant: '', service: { state: 'active', active: true, linked: true } }}>
+      {!cfg ? <Loading label="Connecting to the restaurant…" /> : cfg.service.active ? <TableScreen /> : <ServicePaused state={cfg.service.state} />}
+    </RestaurantContext.Provider>
+  );
+}
+
+function TableScreen() {
   const table = 'T' + Number((location.pathname.match(/\/table\/(\d+)/) || [])[1] || 1);
+  const { restaurant } = useContext(RestaurantContext);
   const { snap, online, now } = useLive(`/api/tables/${table}/events`);
   const [voiceState, setVoiceState] = useState('standby');
   const [toasts, toast] = useToasts();
-  useEffect(() => { document.title = `${tableName(table)} · Tazte`; }, [table]);
+  useEffect(() => { document.title = `${tableName(table)} · ${restaurant}`; }, [table, restaurant]);
   return (
     <div className="min-h-full">
       <header className="sticky z-50 pt-3 pb-2 gutter" style={{ top: 'env(safe-area-inset-top, 0px)' }}>
@@ -129,7 +159,6 @@ function Tablet({ table, state, setVoiceState, toast, now }) {
 
   const [autoListen, setAutoListen] = useState(false);
   const startSession = useCallback(async (withVoice) => {
-    await call('/occupancy', 'POST', {});
     lastAct.current = Date.now();
     warnedRef.current = false;
     setRemaining(IDLE_LIMIT);
@@ -310,11 +339,12 @@ function chime() {
 }
 
 function Standby({ table, onStart }) {
+  const { restaurant } = useContext(RestaurantContext);
   return (
     <section className="max-w-[1400px] mx-auto mt-3 cursor-pointer" onClick={() => onStart(false)}>
       <div className="glass relative overflow-hidden rounded-[28px] px-6 py-14 sm:py-20 text-center">
         <div className="standby-rings" aria-hidden="true"><span /><span /><span /></div>
-        <p className="relative text-[11px] tracking-[0.4em] text-gold-dark uppercase">{tableName(table)} · Welcome</p>
+        <p className="relative text-[11px] tracking-[0.4em] text-gold-dark uppercase">{tableName(table)} · Welcome to {restaurant}</p>
         <h1 className="relative font-serif text-4xl sm:text-6xl text-ink mt-4 leading-[1.08] text-balance">{timeGreeting()}.<br /><em className="text-gold-dark">Your table is ready.</em></h1>
         <p className="relative text-muted mt-5 max-w-md mx-auto">Browse tonight's menu by tapping, or simply tell our assistant what you're in the mood for.</p>
         <div className="relative mt-9 flex flex-col sm:flex-row items-center justify-center gap-3">
@@ -500,10 +530,11 @@ function Customizer({ item, onClose, onAdd }) {
 
 // ---------------- Voice assistant ----------------
 const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, usage, onResult, setVoiceState, bump, toast, autoListen }, ref) {
+  const { restaurant } = useContext(RestaurantContext);
   const [vstate, setV] = useState('idle');
   const [interim, setInterim] = useState('');
   const [turnLeft, setTurnLeft] = useState(MAX_TURN_MS);
-  const greetingRef = useRef(greetingLine());
+  const greetingRef = useRef(`Welcome to ${restaurant}. What would you like to have?`);
   const [log, setLog] = useState([{ id: 0, role: 'assistant', text: greetingRef.current }]);
   const [typed, setTyped] = useState('');
   const [sound, setSound] = useState(true);
@@ -523,7 +554,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, usage, 
   const [phase, setPhase] = useState('');
   useEffect(() => {
     const check = () => fetch('/api/voice').then((r) => r.json()).then((d) => { engineRef.current = d.engine; setEngine(d.engine); ttsRef.current = d.tts; }).catch(() => {});
-    voiceReady.current = check();
+    voiceReady.current = Promise.all([check(), voicesLoaded]);
     const id = setInterval(check, 30000);
     return () => clearInterval(id);
   }, []);
@@ -559,9 +590,17 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, usage, 
 
   function browserSpeak(text, finish) {
     try {
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.03; u.pitch = 1; u.onend = finish; u.onerror = finish;
-      speechSynthesis.speak(u);
+      const voice = preferredVoice();
+      // Chrome's Google voices can stop partway through a long utterance, so queue one sentence at a time.
+      const parts = text.split(/(?<=[.!?])\s+/).filter((s) => s.trim());
+      parts.forEach((part, i) => {
+        const u = new SpeechSynthesisUtterance(part);
+        if (voice) { u.voice = voice; u.lang = voice.lang; }
+        u.rate = VOICE_RATE; u.pitch = 1;
+        if (i === parts.length - 1) u.onend = finish;
+        u.onerror = finish;
+        speechSynthesis.speak(u);
+      });
     } catch (e) { /* no TTS available; say() has a timing fallback */ }
   }
 
@@ -584,9 +623,11 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, usage, 
 
   // Resolves when the line has been spoken (or the timing fallback fires).
   function say(text, force) {
-    const piper = ttsRef.current === 'piper';
-    // Fallback length: the browser voice gets the old estimate; Amy speaks ~13 chars/s plus a round trip.
-    const est = piper ? Math.max(1400, text.length * 75) + 3000 : Math.min(7000, Math.max(1400, text.length * 52)) + 1500;
+    // The British browser voice wins when present; Amy (Piper) is the next choice.
+    const piper = !preferredVoice() && ttsRef.current === 'piper';
+    // Fallback in case no end event arrives: Amy speaks ~13 chars/s plus a round trip; the browser
+    // voice ~14 chars/s at normal rate. Generous, so listening never starts over the reply.
+    const est = piper ? Math.max(1400, text.length * 75) + 3000 : Math.max(1400, (text.length * 70) / VOICE_RATE) + 2000;
     const turn = turnRef.current;
     if (!force) setState('speaking');
     return new Promise((resolve) => {
@@ -777,6 +818,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, usage, 
       const data = await res.json().catch(() => ({}));
       if (turnRef.current !== turn) return;
       setPhase('');
+      if (res.status === 403 && data.error === 'service_suspended') { setState('idle'); serviceChanged(); return; }
       if (res.status === 429) {
         addLog({ role: 'system', tone: 'warn', text: `Voice limit reached for this table. Try again in ${data.retryAfter}s, or type below.` });
         startCooldown(data.retryAfter);
@@ -869,7 +911,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, usage, 
       <div className="px-5 pt-5 pb-4 glass-dark text-cream relative">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <p className="text-[10.5px] tracking-[0.3em] uppercase text-gold">Tazte Assistant</p>
+            <p className="text-[10.5px] tracking-[0.3em] uppercase text-gold">{restaurant} · Assistant</p>
             <p className="font-serif text-xl mt-0.5">{{ idle: 'How can I help?', listening: 'I’m listening…', thinking: 'One moment…', speaking: 'Here’s what I found', cooldown: 'Taking a short pause' }[vstate]}</p>
           </div>
           <button onClick={() => { setSound((s) => !s); stopSpeech(); }} className="w-9 h-9 rounded-full border border-white/20 flex items-center justify-center text-cream/80 hover:text-cream" aria-label={sound ? 'Mute assistant voice' : 'Unmute assistant voice'} title={sound ? 'Voice replies on' : 'Voice replies off'}>

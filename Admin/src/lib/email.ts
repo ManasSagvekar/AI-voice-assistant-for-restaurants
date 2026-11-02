@@ -1,0 +1,83 @@
+// Access emails to restaurants, sent through Resend's HTTP API. White-label: the restaurant's own
+// name only, no product logos. Plain text and simple HTML, no tracking.
+import 'server-only';
+import { planLabel, type Restaurant } from './types';
+
+type Kind = 'welcome' | 'password' | 'pin';
+export type EmailOutcome = { sent: true } | { sent: false; reason: string };
+
+const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const date = (iso: string | null) => (iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : null);
+
+function compose(kind: Kind, r: Restaurant, password?: string) {
+  const until = date(r.subscription_expires_at);
+  const live = r.status === 'active';
+  const subject = {
+    welcome: `${r.name}: your voice assistant access`,
+    password: `${r.name}: your new password`,
+    pin: `${r.name}: your new staff PIN`,
+  }[kind];
+  const intro = {
+    welcome: 'Your restaurant has been approved for the table voice assistant. Here are your sign-in details.',
+    password: 'Your restaurant password has been reset. Use the new one below the next time you connect a computer.',
+    pin: 'Your staff PIN has changed. The old PIN no longer works.',
+  }[kind];
+  const status = live
+    ? `Access is active${until ? ` until ${until}` : ''} on the ${planLabel(r.subscription_plan)} plan.`
+    : r.payment_status === 'unpaid'
+      ? 'Access will start as soon as your payment is confirmed.'
+      : 'Access is currently paused. Contact us to restore it.';
+  const rows: [string, string][] = [
+    ['Restaurant', r.name],
+    ['Username', r.username],
+    ...(password ? [['Password', password] as [string, string]] : []),
+    ['Staff PIN', r.staff_pin],
+  ];
+  const url = process.env.VOICE_ASSISTANT_URL;
+  const steps = [
+    `Open the restaurant dashboard${url ? ` at ${url}` : ''}.`,
+    'The first time, choose Connect and sign in with your username and password.',
+    'After that, staff sign in with the 6-digit staff PIN.',
+  ];
+  const text = [
+    `Hello ${r.name},`, '', intro, '',
+    ...rows.map(([k, v]) => `${k}: ${v}`), '',
+    status, '',
+    ...(kind === 'welcome' ? ['Getting started:', ...steps.map((s, i) => `${i + 1}. ${s}`), ''] : []),
+    'Keep these details private. Anyone with the staff PIN can open your dashboard.',
+  ].join('\n');
+  const html = `<!doctype html><html><body style="margin:0;background:#f6f5f2;font-family:Segoe UI,Arial,sans-serif;color:#1a1a1a">
+<div style="max-width:520px;margin:0 auto;padding:32px 20px">
+  <h1 style="font-size:22px;margin:0 0 16px">${esc(r.name)}</h1>
+  <p style="font-size:15px;line-height:1.5">${esc(intro)}</p>
+  <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e2dc;border-radius:8px;margin:16px 0">
+    ${rows.map(([k, v]) => `<tr><td style="padding:10px 14px;color:#6b665e;font-size:13px;width:40%">${esc(k)}</td><td style="padding:10px 14px;font-family:Consolas,monospace;font-size:15px">${esc(v)}</td></tr>`).join('')}
+  </table>
+  <p style="font-size:15px;line-height:1.5"><strong>${esc(status)}</strong></p>
+  ${kind === 'welcome' ? `<ol style="font-size:15px;line-height:1.6;padding-left:20px">${steps.map((s) => `<li>${esc(s)}</li>`).join('')}</ol>` : ''}
+  <p style="font-size:13px;color:#6b665e;line-height:1.5">Keep these details private. Anyone with the staff PIN can open your dashboard.</p>
+</div></body></html>`;
+  return { subject, text, html };
+}
+
+export async function sendAccessEmail(kind: Kind, r: Restaurant, password?: string): Promise<EmailOutcome> {
+  const key = process.env.RESEND_API_KEY;
+  const from = process.env.EMAIL_FROM;
+  if (!key || !from) return { sent: false, reason: 'Email is not configured (RESEND_API_KEY, EMAIL_FROM).' };
+  const { subject, text, html } = compose(kind, r, password);
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: [r.email], subject, text, html }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      return { sent: false, reason: `Email provider refused it: ${body?.message ?? res.status}` };
+    }
+    return { sent: true };
+  } catch (e) {
+    return { sent: false, reason: `Could not reach the email provider: ${(e as Error).message}` };
+  }
+}

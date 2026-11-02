@@ -2,7 +2,7 @@
 
 const ACCOUNTS = {
   guest: { initial: 'G', name: 'Guest', hi: 'Hi, Guest!', sub: 'Ordering from a table tablet', action: 'Choose your table', href: '#tables', avatar: 'bg-gold text-white' },
-  restaurant: { initial: 'R', name: 'Restaurant', hi: 'Restaurant staff', sub: 'Dashboard access needs the staff PIN', action: 'Open staff dashboard', href: '/admin', avatar: 'bg-ink text-gold' },
+  restaurant: { initial: 'R', name: 'Restaurant', hi: 'Restaurant staff', sub: 'Dashboard access needs the staff PIN', action: 'Open staff dashboard', href: '/restaurant', avatar: 'bg-ink text-gold' },
 };
 const KEY = 'tazte.account';
 const read = () => { try { return localStorage.getItem(KEY); } catch (e) { return null; } };
@@ -59,13 +59,24 @@ document.addEventListener('keydown', (e) => {
 
 select(read() || 'guest');
 
-fetch('/api/config').then((r) => r.json()).then(({ tables }) => {
+fetch('/api/config').then((r) => r.json()).then(({ tables, busy = [], restaurant, service }) => {
+  document.getElementById('restaurant-name').textContent = restaurant;
+  document.title = restaurant;
+  if (!service.active) { document.getElementById('paused').hidden = false; return; }
   const box = document.getElementById('tables');
   for (const t of tables) {
-    const a = document.createElement('a');
-    a.href = '/table/' + t.slice(1);
-    a.className = 'chip glass-chip';
-    a.textContent = 'Table ' + t.slice(1);
-    box.appendChild(a);
+    const occupied = busy.includes(t);
+    const choice = document.createElement(occupied ? 'button' : 'a');
+    if (occupied) {
+      choice.type = 'button';
+      choice.disabled = true;
+      choice.title = 'This table is occupied';
+      choice.setAttribute('aria-label', `Table ${t.slice(1)} is occupied`);
+    } else {
+      choice.href = '/table/' + t.slice(1);
+    }
+    choice.className = 'chip glass-chip' + (occupied ? ' opacity-50 cursor-not-allowed' : '');
+    choice.textContent = 'Table ' + t.slice(1) + (occupied ? ' · Occupied' : ' · Available');
+    box.appendChild(choice);
   }
 });

@@ -5,7 +5,9 @@ Two apps that share one live database:
 | App | Address | Who uses it | Access |
 | --- | --- | --- | --- |
 | Customer tablet | `/table/1` … `/table/8` | Guests, one tablet per table | Open, scoped to its own table |
-| Restaurant dashboard | `/admin` | Staff | Staff PIN, HttpOnly session cookie (12 h) |
+| Restaurant dashboard | `/restaurant` | Staff | Staff PIN, HttpOnly session cookie (12 h) |
+
+`/admin` redirects to `/restaurant` when this server runs on its own. When you run `npm run dev` from the workspace root, `/admin` on the same address is the super-admin app instead (see `../Admin`).
 
 Both are served by one small Node.js server backed by SQLite. A change made in either app goes to the database and is pushed to every open screen over Server-Sent Events, usually in well under a second. That covers orders, order status, 86 toggles, prices, new dishes, server calls and bill requests.
 
@@ -19,7 +21,7 @@ npm run build      # writes public/assets (already included in this folder)
 STAFF_PIN=1801 npm start
 ```
 
-Then open `http://localhost:3000`. If you don't set `STAFF_PIN`, the server uses the default PIN `1801`.
+Then open `http://localhost:3000`. If you don't set `STAFF_PIN`, the server uses the default PIN `1801`. (That applies to standalone mode; see [Restaurant licence](#restaurant-licence-admin-app) for running it under the admin app.)
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -31,12 +33,27 @@ Then open `http://localhost:3000`. If you don't set `STAFF_PIN`, the server uses
 | `WHISPER_MODEL` | `small.en` | Whisper model the service loads |
 | `WHISPER_AUTOSTART` | on | Set to `0` to stop `npm start` launching the Whisper service |
 | `PIPER_VOICE` | `en_US-amy-medium` | Assistant voice ([Piper voices](https://huggingface.co/rhasspy/piper-voices)); downloaded on first start |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY` | unset | Turns on the restaurant licence (below). Anon key only |
+| `LICENSE_GRACE_MINUTES` | `15` | How long to keep serving on the last known licence status while Supabase is unreachable |
+| `RESTAURANT_NAME` | `Restaurant` | Name shown in standalone mode |
 
 Settings can also go in a `.env` file next to `package.json` (see `.env.example`); it is read on start and is git-ignored.
 
+## Restaurant licence (admin app)
+
+With `SUPABASE_URL` and `SUPABASE_ANON_KEY` set, this server is licensed by the admin app in `../Admin`, and `STAFF_PIN` is ignored:
+
+1. **Connect once.** The first visit to `/restaurant` asks for the restaurant username and password from the welcome email. The server signs in to Supabase as that restaurant and keeps only the refresh token (in the `settings` table), so it stays connected across restarts.
+2. **Staff PIN.** Staff then sign in with the 6-digit PIN set in the admin app, checked by Supabase (`verify_staff_pin`). A PIN only works on its own restaurant's server.
+3. **Access checks.** The status is re-checked every 10 seconds and on every voice request (`increment_usage`, which also counts it against the restaurant's rate limit). When the admin marks the restaurant unpaid or suspends it, or it is flagged for abuse or its plan expires, the server closes every staff session and live screen, refuses table and staff requests with `403 service_suspended`, and both apps show a paused screen. Reaching the rate limit blocks that same request.
+4. **Branding.** Both apps show the restaurant's name from the admin app in place of any product logo.
+5. **Privacy.** Only request counts are sent to Supabase. Orders, bills and totals never leave this server.
+
+If Supabase can't be reached, the server keeps serving on the last known status for `LICENSE_GRACE_MINUTES`, still enforcing the plan's end date locally; after that it pauses until the connection returns. `server/license.js` holds this logic and `server/supabase.js` the minimal REST client.
+
 Staff can change the active table count from the dashboard's **Tables** tab (1–99). The value is stored in SQLite and takes precedence over `TABLE_COUNT` on later starts; `TABLE_COUNT` is used as the initial value for a fresh database. Reducing the count disables those table URLs but retains their saved data.
 
-When a guest starts a tablet session, that table is marked **Occupied** in the staff dashboard. Use **Mark paid** on its bill request to settle the check and return the table to **Available**.
+Tables start **Available** and become **Occupied** when the first order is sent to the kitchen. On upgrade, old session-only occupancy is reconciled against unpaid orders. The staff dashboard's **Tables** tab has a status switch for manually marking a table occupied or available. Guests can only select available tables from the landing page; opening an occupied table URL redirects them back to the table chooser. Marking a bill request paid also returns its table to **Available**.
 
 It deploys to any host that runs Node, such as a VPS, Render, Railway or Fly.io. Put it behind HTTPS; the session cookie is marked `Secure` automatically when the proxy sends `X-Forwarded-Proto: https`.
 
@@ -54,12 +71,12 @@ whisper-service/.venv/Scripts/python -m pip install torch --index-url https://do
 whisper-service/.venv/Scripts/python -m pip install -r whisper-service/requirements.txt
 ```
 
-(On macOS/Linux the interpreter is `whisper-service/.venv/bin/python`.) After that, `npm start` launches the Whisper service automatically; the first start downloads the model (~460 MB for `small.en`). `npm run whisper` runs it on its own. The assistant's spoken replies use **Amy**, the local [Piper](https://github.com/OHF-Voice/piper1-gpl) voice from the Alice assistant, synthesized by the same service (`POST /api/tables/:t/speak`, cached, 30 replies per minute per table); the voice file (~60 MB) downloads on first start. If Whisper isn't installed or stops responding, tablets fall back to the browser's built-in speech recognition and voice; if the VAD can't load, a simple loudness detector ends turns instead. The VAD's runtime files (`public/assets/vendor/ort`, `vad`, about 17 MB) are copied by `npm run build` and cached by tablets for a day.
+(On macOS/Linux the interpreter is `whisper-service/.venv/bin/python`.) After that, `npm start` launches the Whisper service automatically; the first start downloads the model (~460 MB for `small.en`). `npm run whisper` runs it on its own. The assistant's spoken replies use Chrome's **Google UK English Female** voice at 1.12× speed (`VOICE_NAME` and `VOICE_RATE` in `customer-app/client/customer.jsx`), spoken a sentence at a time. Google's voices are synthesized online, so reply text (not guest audio) goes to Google. On browsers without it, another British female voice is used, then **Amy**, the local [Piper](https://github.com/OHF-Voice/piper1-gpl) voice from the Alice assistant, synthesized by the same service (`POST /api/tables/:t/speak`, cached, 30 replies per minute per table; the voice file, ~60 MB, downloads on first start). If Whisper isn't installed or stops responding, tablets fall back to the browser's built-in speech recognition and voice; if the VAD can't load, a simple loudness detector ends turns instead. The VAD's runtime files (`public/assets/vendor/ort`, `vad`, about 17 MB) are copied by `npm run build` and cached by tablets for a day.
 
 ## How it fits together
 
 ```
-customer tablet (/table/4) ──┐                ┌── restaurant dashboard (/admin)
+customer tablet (/table/4) ──┐                ┌── restaurant dashboard (/restaurant)
    speech capture, UI        │  JSON + SSE    │    login, orders, menu, requests
                              ▼                ▼
                      server/index.js     routes, staff auth, live updates

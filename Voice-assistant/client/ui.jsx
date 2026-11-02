@@ -1,6 +1,6 @@
 import { MODIFIERS } from '../shared/engine.js';
 
-export const { useState, useEffect, useRef, useMemo, useCallback } = React;
+export const { useState, useEffect, useRef, useMemo, useCallback, useContext, createContext } = React;
 
 export const uid = (p) => p + Math.random().toString(36).slice(2, 8).toUpperCase();
 export const tableName = (t) => 'Table ' + t.slice(1);
@@ -111,8 +111,52 @@ export async function api(path, method = 'GET', body) {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new ApiError(res.status, data);
+  if (!res.ok) {
+    if (res.status === 403 && data.error === 'service_suspended') serviceChanged();
+    throw new ApiError(res.status, data);
+  }
   return data;
+}
+
+// ---------- restaurant & service status ----------
+// The restaurant's own name replaces any product branding, and both apps stop when the admin app
+// suspends the restaurant. Any sign that the service changed triggers an immediate re-check.
+export const serviceChanged = () => window.dispatchEvent(new Event('service-change'));
+export const RestaurantContext = createContext({ restaurant: '', service: { state: 'active', active: true, linked: true } });
+export function useRestaurant() {
+  const [cfg, setCfg] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () => fetch('/api/config', { cache: 'no-store' }).then((r) => r.json())
+      .then((d) => alive && setCfg((prev) => (JSON.stringify(prev) === JSON.stringify(d) ? prev : d))).catch(() => {});
+    load();
+    const id = setInterval(load, 15000);
+    window.addEventListener('service-change', load);
+    return () => { alive = false; clearInterval(id); window.removeEventListener('service-change', load); };
+  }, []);
+  return cfg;
+}
+
+const PAUSED = {
+  unlinked: ['Not set up yet', 'This system has not been connected to its restaurant account yet.'],
+  unpaid: ['Service paused', 'The subscription payment is pending. Contact your service provider to restore access.'],
+  expired: ['Subscription ended', 'The subscription period has ended. Contact your service provider to renew it.'],
+  flagged: ['Service paused', 'Unusually high voice usage was detected and access was paused for review. Your service provider has been alerted.'],
+  suspended: ['Service suspended', 'Access has been suspended by your service provider. Contact them for details.'],
+  offline: ['Can’t verify the subscription', 'This computer can’t reach the licence server. Check its internet connection; service resumes automatically.'],
+};
+export function ServicePaused({ state, staff }) {
+  const { restaurant } = useContext(RestaurantContext);
+  const [title, text] = staff ? PAUSED[state] || PAUSED.suspended : ['The assistant is resting', 'Table ordering is unavailable right now. A member of staff will be happy to take your order.'];
+  return (
+    <main className="gutter min-h-[100vh] flex items-center justify-center text-center">
+      <div className="w-full max-w-md glass rounded-3xl p-8" role="status">
+        <p className="font-serif text-2xl">{restaurant}</p>
+        <h1 className="font-serif text-3xl mt-6">{title}</h1>
+        <p className="text-sm text-muted mt-2">{text}</p>
+      </div>
+    </main>
+  );
 }
 
 // Live snapshot over Server-Sent Events; EventSource reconnects on its own.
@@ -129,7 +173,7 @@ export function useLive(url) {
       skew.current = d.now - Date.now();
       setSnap(d); setOnline(true);
     });
-    es.onerror = () => setOnline(false);
+    es.onerror = () => { setOnline(false); serviceChanged(); };
     return () => es.close();
   }, [url]);
   useEffect(() => { const id = setInterval(() => setNow(Date.now() + skew.current), 1000); return () => clearInterval(id); }, []);
@@ -146,12 +190,15 @@ export function useToasts() {
   return [toasts, toast];
 }
 
-export const Brand = ({ sub = 'FINE DINING' }) => (
-  <div className="flex items-center gap-3">
-    <img src="/assets/tazte-logo.png?v=2" alt="Tazte logo" className="h-11 w-auto shrink-0" />
-    <div className="text-[9.5px] tracking-[0.24em] text-gold-dark">{sub}</div>
-  </div>
-);
+export function Brand({ sub = 'FINE DINING' }) {
+  const { restaurant } = useContext(RestaurantContext);
+  return (
+    <div className="flex flex-col min-w-0">
+      <span className="font-serif text-xl leading-tight text-ink truncate max-w-[60vw] sm:max-w-[320px]">{restaurant}</span>
+      <span className="text-[9.5px] tracking-[0.24em] text-gold-dark">{sub}</span>
+    </div>
+  );
+}
 
 export const LiveBadge = ({ online }) => (
   <span className={'flex items-center gap-1.5 text-xs font-medium rounded-full px-2.5 py-1.5 border ' + (online ? 'border-line bg-cream text-ink' : 'border-[#EBC88F] bg-[#FFF4E5] text-[#7A4B06]')} aria-live="polite">

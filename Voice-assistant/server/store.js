@@ -61,6 +61,14 @@ export function createStore(file) {
     tx(() => SEED_MENU.forEach((m, i) => q('INSERT INTO menu_items (id, sort, data) VALUES (?, ?, ?)').run(m.id, i, json(m))))();
   }
 
+  if (!q('SELECT value FROM settings WHERE key = ?').get('table_occupancy_order_v1')) {
+    q(`UPDATE table_statuses
+       SET occupied = CASE WHEN EXISTS (
+         SELECT 1 FROM orders WHERE orders.table_id = table_statuses.table_id AND orders.paid = 0
+       ) THEN 1 ELSE 0 END`).run();
+    q('INSERT INTO settings (key, value) VALUES (?, ?)').run('table_occupancy_order_v1', '1');
+  }
+
   // ---------- menu ----------
   const menu = () => q('SELECT data FROM menu_items ORDER BY sort').all().map((r) => JSON.parse(r.data));
   const item = (itemId) => { const r = q('SELECT data FROM menu_items WHERE id = ?').get(itemId); return r ? JSON.parse(r.data) : null; };
@@ -116,9 +124,10 @@ export function createStore(file) {
     const row = q('SELECT occupied FROM table_statuses WHERE table_id = ?').get(table);
     return [table, !!row?.occupied];
   }));
-  const setTableOccupied = tx((table, occupied) =>
+  const writeTableOccupied = (table, occupied) =>
     q('INSERT INTO table_statuses (table_id, occupied) VALUES (?, ?) ON CONFLICT(table_id) DO UPDATE SET occupied = excluded.occupied')
-      .run(table, occupied ? 1 : 0));
+      .run(table, occupied ? 1 : 0);
+  const setTableOccupied = tx(writeTableOccupied);
   const clearTable = (table) => {
     q('DELETE FROM cart_lines WHERE table_id = ?').run(table);
     q('DELETE FROM table_notes WHERE table_id = ?').run(table);
@@ -147,6 +156,7 @@ export function createStore(file) {
     };
     q(`INSERT INTO orders (id, seq, table_id, status, created_at, prep_mins, note, lines, subtotal, tax, total)
        VALUES (?, ?, ?, 'received', ?, ?, ?, ?, ?, ?, ?)`).run(order.id, seq, table, now(), order.prepMins, note(table), json(order.lines), t.subtotal, t.tax, t.total);
+    writeTableOccupied(table, true);
     clearTable(table);
     return order.id;
   });
@@ -194,10 +204,11 @@ export function createStore(file) {
   const addSession = (hash, ttlMs) => { q('DELETE FROM staff_sessions WHERE expires_at < ?').run(now()); q('INSERT INTO staff_sessions VALUES (?, ?)').run(hash, now() + ttlMs); };
   const hasSession = (hash) => !!q('SELECT 1 FROM staff_sessions WHERE token_hash = ? AND expires_at > ?').get(hash, now());
   const dropSession = (hash) => q('DELETE FROM staff_sessions WHERE token_hash = ?').run(hash);
+  const dropAllSessions = () => q('DELETE FROM staff_sessions').run();
 
   return {
     db, menu, item, updateItem, publishItems, cart, note, addToCart, changeQty, removeLine, removeItem, setNote, resetTable,
     tableOrders, recentOrders, placeOrder, advanceOrder, requests, addRequest, setRequestStatus, tableStatuses, setTableOccupied, logSecurity, security,
-    setting, addSession, hasSession, dropSession, categories: CATEGORIES,
+    setting, addSession, hasSession, dropSession, dropAllSessions, categories: CATEGORIES,
   };
 }

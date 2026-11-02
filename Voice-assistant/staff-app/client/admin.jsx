@@ -1,24 +1,62 @@
 import { fmt, CATEGORIES, catLabel, RATE_LIMIT, parseMenuText, SAMPLE_EXTRACTION } from '../../shared/engine.js';
 import {
   useState, useEffect, useRef, useCallback, tableName, mmss, ago, modsText, Icon, DietMark, DishImage, Switch,
-  Toasts, api, useLive, useToasts, Brand, LiveBadge, Loading,
+  Toasts, api, useLive, useToasts, Brand, LiveBadge, Loading, useContext, RestaurantContext, useRestaurant, ServicePaused, serviceChanged,
 } from '../../client/ui.jsx';
 
 function AdminApp() {
+  const cfg = useRestaurant();
   const [auth, setAuth] = useState('checking'); // checking | out | in
   const [toasts, toast] = useToasts();
   useEffect(() => { api('/api/admin/me').then(() => setAuth('in'), () => setAuth('out')); }, []);
+  // A suspension closes every staff session on the server, so sign in again once service resumes.
+  const active = cfg ? cfg.service.active : true;
+  useEffect(() => { if (!active) setAuth('out'); }, [active]);
   const logout = async () => { try { await api('/api/admin/logout', 'POST', {}); } catch (e) {} setAuth('out'); };
   return (
-    <div className="min-h-full glass-bg">
-      {auth === 'in' ? <Dashboard toast={toast} onLogout={logout} onExpired={() => setAuth('out')} />
-        : auth === 'out' ? <Login onIn={() => setAuth('in')} /> : <Loading label="Checking your staff session…" />}
-      <Toasts toasts={toasts} />
-    </div>
+    <RestaurantContext.Provider value={cfg || { restaurant: '', service: { state: 'active', active: true, linked: true } }}>
+      <div className="min-h-full glass-bg">
+        {!cfg ? <Loading label="Checking your staff session…" />
+          : cfg.service.state === 'unlinked' ? <Connect />
+          : !cfg.service.active ? <ServicePaused state={cfg.service.state} staff />
+          : auth === 'in' ? <Dashboard toast={toast} onLogout={logout} onExpired={() => setAuth('out')} />
+          : auth === 'out' ? <Login onIn={() => setAuth('in')} licensed={cfg.service.state !== 'standalone'} /> : <Loading label="Checking your staff session…" />}
+        <Toasts toasts={toasts} />
+      </div>
+    </RestaurantContext.Provider>
   );
 }
 
-function Login({ onIn }) {
+// First run: link this system to its restaurant account with the details from the welcome email.
+function Connect() {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setErr('');
+    try { await api('/api/admin/connect', 'POST', { username: username.trim(), password }); serviceChanged(); } catch (x) { setErr(x.message); setPassword(''); }
+    setBusy(false);
+  };
+  const field = 'w-full bg-sand rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-gold/50';
+  return (
+    <main className="gutter min-h-[100vh] flex items-center justify-center">
+      <form onSubmit={submit} className="w-full max-w-sm glass rounded-3xl p-8">
+        <h1 className="font-serif text-3xl">Connect your restaurant</h1>
+        <p className="text-sm text-muted mt-1">Enter the restaurant username and password from your welcome email. You only need to do this once on this computer.</p>
+        <label htmlFor="connect-user" className="label block mt-6 mb-2">Restaurant username</label>
+        <input id="connect-user" autoComplete="username" autoFocus value={username} onChange={(e) => setUsername(e.target.value.slice(0, 64))} className={field} />
+        <label htmlFor="connect-pass" className="label block mt-4 mb-2">Password</label>
+        <input id="connect-pass" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value.slice(0, 200))} className={field} />
+        {err && <p className="text-sm text-[#B5462E] mt-2" role="alert">{err}</p>}
+        <button disabled={!username.trim() || !password || busy} className="btn-gold w-full justify-center mt-5 disabled:bg-[#CFC6B8]">{busy ? 'Connecting…' : 'Connect'}</button>
+      </form>
+    </main>
+  );
+}
+
+function Login({ onIn, licensed }) {
   const [pin, setPin] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
@@ -33,12 +71,12 @@ function Login({ onIn }) {
       <form onSubmit={submit} className="w-full max-w-sm glass rounded-3xl p-8">
         <Brand sub="RESTAURANT STAFF" />
         <h1 className="font-serif text-3xl mt-8">Staff sign in</h1>
-        <p className="text-sm text-muted mt-1">Enter the staff PIN to open the operations dashboard.</p>
+        <p className="text-sm text-muted mt-1">Enter the {licensed ? '6-digit ' : ''}staff PIN to open the operations dashboard.</p>
         <label htmlFor="staff-pin" className="label block mt-6 mb-2">Staff PIN</label>
-        <input id="staff-pin" type="password" inputMode="numeric" autoComplete="current-password" autoFocus value={pin} onChange={(e) => setPin(e.target.value.slice(0, 32))}
+        <input id="staff-pin" type="password" inputMode="numeric" autoComplete="current-password" autoFocus value={pin} onChange={(e) => setPin(licensed ? e.target.value.replace(/\D/g, '').slice(0, 6) : e.target.value.slice(0, 32))}
           className="w-full bg-sand rounded-xl px-4 py-3 text-lg tracking-[0.4em] focus:outline-none focus:ring-2 focus:ring-gold/50" />
         {err && <p className="text-sm text-[#B5462E] mt-2" role="alert">{err}</p>}
-        <button disabled={!pin || busy} className="btn-gold w-full justify-center mt-5 disabled:bg-[#CFC6B8]">{busy ? 'Signing in…' : 'Sign in'}</button>
+        <button disabled={!pin || (licensed && pin.length !== 6) || busy} className="btn-gold w-full justify-center mt-5 disabled:bg-[#CFC6B8]">{busy ? 'Signing in…' : 'Sign in'}</button>
         <p className="text-[12px] text-muted mt-5">Guests use the table tablets at /table/1, /table/2 and so on. They can't open this page.</p>
       </form>
     </main>
@@ -56,6 +94,7 @@ function Dashboard({ toast, onLogout, onExpired }) {
         case 'PUBLISH_ITEMS': return await api('/api/admin/menu', 'POST', { items: a.items });
         case 'ADVANCE_ORDER': return await api(`/api/admin/orders/${a.id}/advance`, 'POST', {});
         case 'REQUEST_STATUS': return await api(`/api/admin/requests/${a.id}`, 'POST', { status: a.status });
+        case 'SET_TABLE_OCCUPIED': return await api(`/api/admin/tables/${a.table}/occupancy`, 'PATCH', { occupied: a.occupied });
         case 'SET_TABLE_COUNT': return await api('/api/admin/settings/table-count', 'PATCH', { count: a.count });
       }
     } catch (e) {
@@ -64,7 +103,8 @@ function Dashboard({ toast, onLogout, onExpired }) {
       return null;
     }
   }, [toast, onExpired]);
-  useEffect(() => { document.title = 'Tazte · Restaurant dashboard'; }, []);
+  const { restaurant } = useContext(RestaurantContext);
+  useEffect(() => { document.title = `${restaurant} · Dashboard`; }, [restaurant]);
   const openRequests = snap ? snap.requests.filter((r) => r.status === 'open').length : 0;
   return (
     <>
@@ -103,6 +143,13 @@ function TablesView({ state, now, dispatch, toast }) {
             <p className="text-[13px] text-muted">{inCart ? `${inCart} item${inCart === 1 ? '' : 's'} being chosen` : 'Nothing in the cart'}</p>
             <p className="text-[13px] text-muted">{orders.length ? `${orders.length} order${orders.length === 1 ? '' : 's'} in progress` : 'No open orders'}</p>
             {reqs.length > 0 && <p className="text-[13px] font-medium text-[#8A2E1C]">{reqs.map((r) => (r.type === 'bill' ? 'Bill requested' : 'Server called')).join(' · ')}</p>}
+            <div className="flex items-center justify-between mt-2">
+              <span className="text-[13px] text-muted">Table status</span>
+              <Switch id={`occupancy-${t}`} on={occupied} label={`${tableName(t)} occupied`} onChange={async () => {
+                const result = await dispatch({ type: 'SET_TABLE_OCCUPIED', table: t, occupied: !occupied });
+                if (result) toast(`${tableName(t)} marked ${occupied ? 'available' : 'occupied'}.`);
+              }} />
+            </div>
             <a href={`/table/${t.slice(1)}`} target="_blank" rel="noopener" className="text-[13px] text-gold-dark hover:underline mt-1">Open this tablet</a>
           </article>
         );
@@ -147,13 +194,16 @@ function TableCountControl({ count, dispatch, toast }) {
 }
 
 function Admin({ state, dispatch, now, toast, activeOrders, openRequests }) {
+  const { restaurant } = useContext(RestaurantContext);
   const [tab, setTab] = useState('orders');
   const offCount = state.menu.filter((m) => !m.available).length;
   const blocks = state.security.length;
+  const busyTables = state.tables.filter((t) => state.occupancy?.[t]).length;
   const tabs = [['orders', 'Live Orders', activeOrders], ['tables', 'Tables', null], ['menu', 'Menu Control', null], ['ingest', 'AI Menu Ingestor', null], ['requests', 'Service Requests', openRequests], ['security', 'Security Log', blocks]];
   const kpis = [
     ['Active orders', activeOrders, `${state.orders.filter((o) => o.status === 'kitchen').length} in the kitchen`],
     ['Open requests', openRequests, 'Server calls and bills'],
+    ['Tables in use', `${busyTables} / ${state.tables.length}`, `${state.tables.length - busyTables} free · see the Tables tab`],
     ['86’d items', offCount, `${state.menu.length} dishes on the menu`],
     ['Blocked or throttled', blocks, 'Guardrail, schema, rate limit'],
   ];
@@ -163,10 +213,10 @@ function Admin({ state, dispatch, now, toast, activeOrders, openRequests }) {
         <section className="mt-3 flex flex-wrap items-end justify-between gap-3">
           <div>
             <p className="text-[11px] tracking-[0.3em] text-gold-dark uppercase">Operations · Dinner service</p>
-            <h1 className="font-serif text-3xl sm:text-[40px] leading-tight mt-1">Restaurant dashboard</h1>
+            <h1 className="font-serif text-3xl sm:text-[40px] leading-tight mt-1">{restaurant}</h1>
           </div>
         </section>
-        <section className="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <section className="mt-5 grid grid-cols-2 lg:grid-cols-5 gap-3">
           {kpis.map(([l, v, s]) => (
             <div key={l} className="glass rounded-2xl px-4 py-3">
               <p className="label">{l}</p>
