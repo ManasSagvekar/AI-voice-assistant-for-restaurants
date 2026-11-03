@@ -92,6 +92,8 @@ function toPcm16(parts, rate) {
 // permission prompt instead of quietly blocking a later, timer-driven start. Resolves to true,
 // or to the DOMException name when access is refused.
 let micGranted = false;
+const MIC_BLOCKED = 'Microphone access is blocked. Click the lock icon in the address bar, allow the microphone, then tap the mic again.';
+const NO_MIC = 'No microphone was found on this device.';
 function primeMic() {
   if (micGranted || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) return Promise.resolve(true);
   return navigator.mediaDevices.getUserMedia({ audio: true }).then(
@@ -976,6 +978,8 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
     toast(reason, 'warn');
     clearTimers(); stopRec(); setState('idle');
   }
+  // A refused microphone: `name` is the DOMException name from getUserMedia.
+  const micRefused = (name) => micUnavailable(name === 'NotFoundError' ? NO_MIC : MIC_BLOCKED);
 
   // The recognizer heard sound but returned no words, or stopped without hearing anything.
   function heardNothing() {
@@ -1019,10 +1023,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
   // Whisper service. The turn cap or a second mic tap submits whatever speech was heard so far.
   async function listenWhisper() {
     const mic = await primeMic();
-    if (mic !== true) {
-      micUnavailable(mic === 'NotFoundError' ? 'No microphone was found on this device.' : 'Microphone access is blocked. Click the lock icon in the address bar, allow the microphone, then tap the mic again.');
-      return;
-    }
+    if (mic !== true) return micRefused(mic);
     const vad = await loadVad();
     if (!vad) return listenLoudness();
     const turn = beginTurn();
@@ -1055,10 +1056,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
   async function listenLoudness(hold = false) {
     let stream;
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } }); }
-    catch (e) {
-      micUnavailable(e.name === 'NotFoundError' ? 'No microphone was found on this device.' : 'Microphone access is blocked. Click the lock icon in the address bar, allow the microphone, then tap the mic again.');
-      return;
-    }
+    catch (e) { return micRefused(e.name); }
     micGranted = true;
     const turn = beginTurn();
     const ac = new (window.AudioContext || window.webkitAudioContext)();
@@ -1135,10 +1133,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) { micUnavailable('Voice input is not supported in this browser. Try Chrome or Edge, or type / tap a phrase instead.'); return; }
     const mic = await primeMic();
-    if (mic !== true) {
-      micUnavailable(mic === 'NotFoundError' ? 'No microphone was found on this device.' : 'Microphone access is blocked. Click the lock icon in the address bar, allow the microphone, then tap the mic again.');
-      return;
-    }
+    if (mic !== true) return micRefused(mic);
     const turn = beginTurn();
     try {
       const rec = new SR();
@@ -1154,8 +1149,8 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
       };
       rec.onerror = (e) => {
         if (turnRef.current !== turn) return;
-        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { micGranted = false; micUnavailable('Microphone access is blocked. Click the lock icon in the address bar, allow the microphone, then tap the mic again.'); }
-        else if (e.error === 'audio-capture') micUnavailable('No microphone was found on this device.');
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { micGranted = false; micUnavailable(MIC_BLOCKED); }
+        else if (e.error === 'audio-capture') micUnavailable(NO_MIC);
         else if (e.error === 'network') micUnavailable('The browser’s speech service could not be reached. Check your internet connection and try again.');
         else if (e.error === 'no-speech') heardNothing();
         else if (e.error !== 'aborted') { clearTimers(); stopRec(); setState('idle'); }
