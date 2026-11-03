@@ -47,6 +47,8 @@ export const PLANS: { value: Plan; label: string }[] = [
   { value: '6_month', label: '6 months' },
   { value: 'yearly', label: 'Yearly' },
 ];
+export const isPlan = (v: unknown): v is Plan => PLANS.some((p) => p.value === v);
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const planLabel = (p: Plan) => PLANS.find((x) => x.value === p)?.label ?? p;
 export const isDailyWindow = (w: string) => /day/.test(w);
 

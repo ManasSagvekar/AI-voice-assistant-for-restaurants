@@ -5,13 +5,11 @@
 import 'server-only';
 import { createHmac, createHash, timingSafeEqual } from 'node:crypto';
 import { supabaseAdmin } from './supabaseAdmin';
-import { PLANS, planLabel, type Plan, type Restaurant } from './types';
+import { isPlan, planLabel, UUID, type Plan, type Restaurant } from './types';
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PRICE_ENV: Record<Plan, string> = {
   monthly: 'RAZORPAY_PRICE_MONTHLY', '3_month': 'RAZORPAY_PRICE_3_MONTH', '6_month': 'RAZORPAY_PRICE_6_MONTH', yearly: 'RAZORPAY_PRICE_YEARLY',
 };
-const isPlan = (v: unknown): v is Plan => PLANS.some((p) => p.value === v);
 
 export const razorpayConfigured = () => !!(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
 

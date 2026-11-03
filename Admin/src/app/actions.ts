@@ -8,13 +8,11 @@ import { generatePassword, generatePin } from '@/lib/credentials';
 import { sendAccessEmail, type EmailOutcome } from '@/lib/email';
 import { createPaymentLink } from '@/lib/billing';
 import { sendDueReminders } from '@/lib/reminders';
-import { PLANS, RESTAURANT_COLUMNS as COLUMNS, type ActionResult, type Plan, type Restaurant } from '@/lib/types';
+import { isPlan, UUID, RESTAURANT_COLUMNS as COLUMNS, type ActionResult, type Plan, type Restaurant } from '@/lib/types';
 
 const USERNAME = /^[a-z0-9][a-z0-9_.-]{2,39}$/;
 const EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const PIN = /^\d{6}$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const isPlan = (v: unknown): v is Plan => PLANS.some((p) => p.value === v);
 const fmtDate = (iso: string | null) => (iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : 'no date');
 
 const done = (message: string, secret?: string): ActionResult => { revalidatePath('/'); return { ok: true, message, secret }; };
