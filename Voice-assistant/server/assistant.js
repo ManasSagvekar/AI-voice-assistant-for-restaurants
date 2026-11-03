@@ -28,6 +28,8 @@ export function createAssistant(store) {
   const resetUsage = (table) => stamps.delete(table);
   // Called whenever an order is sent or the table is reset, by any route.
   const forget = (table) => { pending.delete(table); offered.delete(table); };
+  // Called when this computer switches restaurant.
+  const reset = () => { stamps.clear(); pending.clear(); offered.clear(); };
 
   const cartKey = (table) => JSON.stringify(store.cart(table).map((l) => [l.itemId, l.qty, l.mods]));
 
@@ -226,5 +228,5 @@ export function createAssistant(store) {
     return { status: 200, body: { text: out.join(' '), heard: text, truncated, inspected: inspected[0] && inspected[0].tool === 'fallback' ? [] : inspected, effects, usage: usage(table) } };
   }
 
-  return { handle, usage, resetUsage, forget };
+  return { handle, usage, resetUsage, forget, reset };
 }

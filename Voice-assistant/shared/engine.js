@@ -34,7 +34,16 @@ export const ALLERGEN_KEYS = Object.keys(ALLERGENS);
 export const allergenLabel = (k) => (ALLERGENS[k] ? ALLERGENS[k].label : k);
 export const allergensIn = (t) => ALLERGEN_KEYS.filter((k) => ALLERGENS[k].re.test(t));
 
-export const fmt = (n) => '$' + (Math.round(n * 100) / 100).toFixed(2);
+// The restaurant's currency and its own menu sections (from an imported menu). The server sets them
+// for the restaurant in use; tablets and staff screens from each live snapshot.
+export const CURRENCIES = { USD: '$', AED: 'AED ', INR: '₹', EUR: '€', GBP: '£', SAR: 'SAR ', QAR: 'QAR ', KWD: 'KWD ', OMR: 'OMR ', BHD: 'BHD ', SGD: 'S$', MYR: 'RM ', PKR: 'Rs ' };
+const menuMeta = { currency: 'USD', sections: [] };
+export function setMenuMeta({ currency, sections } = {}) {
+  if (CURRENCIES[currency]) menuMeta.currency = currency;
+  if (Array.isArray(sections)) menuMeta.sections = sections;
+}
+export const currency = () => menuMeta.currency;
+export const fmt = (n) => CURRENCIES[menuMeta.currency] + (Math.round(n * 100) / 100).toFixed(2);
 
 const U = (id) => `https://images.unsplash.com/photo-${id}?auto=format&fit=crop&w=640&q=70`;
 
@@ -47,7 +56,20 @@ export const CATEGORIES = [
   { id: 'beverages', label: 'Beverages' },
   { id: 'specials', label: 'Chef Specials' },
 ];
-export const catLabel = (id) => (CATEGORIES.find((c) => c.id === id) || {}).label || id;
+export const catLabel = (id) => (menuMeta.sections.find((c) => c.id === id) || CATEGORIES.find((c) => c.id === id) || {}).label || id;
+const BUILT_IN_CATS = CATEGORIES.map((c) => c.id).filter((c) => c !== 'all' && c !== 'specials');
+export const isCategory = (id) => BUILT_IN_CATS.includes(id) || menuMeta.sections.some((c) => c.id === id);
+// The tablet's category rail: All, chef specials when there are any, then each category the menu
+// uses, in menu order (an imported menu keeps its own sections and their order).
+export function menuCategories(menu) {
+  const used = [];
+  for (const m of menu) if (!used.includes(m.category)) used.push(m.category);
+  return [
+    { id: 'all', label: catLabel('all') },
+    ...(menu.some((m) => m.chefSpecial) ? [{ id: 'specials', label: catLabel('specials') }] : []),
+    ...used.map((id) => ({ id, label: catLabel(id) })),
+  ];
+}
 
 // Modifier catalogue. Surcharges live here, server-side, never in user text.
 export const MODIFIERS = {
@@ -306,10 +328,19 @@ export function extractFilters(t) {
     ['beverages', /\b(drinks?|beverages?|mocktails?|juices?|coffee|something to drink)\b/],
   ];
   for (const [id, re] of cats) if (re.test(t)) { f.category = id; found = true; break; }
-  const mp = t.match(/\b(under|below|less than|cheaper than|max(?:imum)?|up to|within)\s*\$?\s*(\d{1,3})\b/);
+  // An imported menu's own sections: "show me the biryanis" finds "Popular Biryani & Rice Items".
+  if (f.category === 'all') {
+    for (const sec of menuMeta.sections) if (sectionWords(sec.label).some((w) => new RegExp(`\\b${w}(s|es|ies|y)?\\b`).test(t))) { f.category = sec.id; found = true; break; }
+  }
+  const mp = t.match(/\b(under|below|less than|cheaper than|max(?:imum)?|up to|within)\s*(?:\$|aed|rs|inr|₹|€|£)?\s*(\d{1,6})\b/);
   if (mp) { f.maxPrice = parseInt(mp[2], 10); found = true; }
   return { filters: f, found };
 }
+
+const SECTION_STOP = new Set(['popular', 'items', 'item', 'main', 'mains', 'course', 'courses', 'house', 'special', 'specials', 'signature', 'with', 'from', 'menu', 'dishes', 'dish', 'selection', 'assorted', 'fresh', 'our', 'the', 'and', 'all', 'more', 'other', 'others', 'sides', 'side']);
+// The words a guest might use for a section, reduced to a stem that also matches plurals.
+const sectionWords = (label) => norm(label).split(' ').filter((w) => w.length >= 4 && !SECTION_STOP.has(w))
+  .map((w) => w.replace(/(ies|es|s)$/, '')).filter((w) => w.length >= 3);
 
 // Returns raw "LLM" tool calls. These are untrusted until validateCall() passes them.
 export function parseIntent(raw, menu) {
@@ -369,7 +400,8 @@ const T = {
 export const TOOL_SCHEMAS = {
   apply_filters: {
     diet: T.oneOf([null, 'veg', 'nonveg']), vegan: T.bool, gf: T.bool, jain: T.bool, halal: T.bool, avoid: T.listOf(ALLERGEN_KEYS, 6),
-    spice: T.oneOf([null, 'spicy', 'mild']), meal: T.oneOf([null, ...MEALS]), category: T.oneOf(CATEGORIES.map((c) => c.id)), maxPrice: T.num(1, 500),
+    spice: T.oneOf([null, 'spicy', 'mild']), meal: T.oneOf([null, ...MEALS]),
+    category: (v) => (v === 'all' || v === 'specials' || isCategory(v) ? null : 'must be a menu category'), maxPrice: T.num(1, 100000),
   },
   allergen_check: { item_id: 'menu_item', allergen: T.oneOf(ALLERGEN_KEYS) },
   cancel_order: {},
@@ -422,18 +454,21 @@ export function validateCall(call, menu) {
 // ---------- Menu ingestion helpers ----------
 export function inferTags(name, desc = '') {
   const t = norm(name + ' ' + desc);
-  const nonveg = /\b(chicken|beef|(?<!(cauliflower|tofu|mushroom|celeriac|cabbage) )steak|lamb|pork|duck|boar|bacon|salami|nduja|prosciutto|fish|salmon|tuna|cod|shrimp|prawns?|crab|lobster|squid|calamari|anchov(y|ies)|veal|venison)\b/.test(t);
-  const dairy = /\b(cheese|cream|butter|milk|ricotta|mascarpone|parmesan|parmigiano|burrata|mozzarella|fior di latte|yogurt|labneh|gelato|creme|anglaise|custard|pecorino)\b/.test(t);
+  const nonveg = /\b(chicken|mutton|goat|keema|kheema|gosht|seekh|shawarma|kebab|kabab|beef|(?<!(cauliflower|tofu|mushroom|celeriac|cabbage) )steak|lamb|pork|duck|boar|bacon|salami|nduja|prosciutto|fish|salmon|tuna|cod|shrimp|prawns?|crab|lobster|squid|calamari|anchov(y|ies)|veal|venison)\b/.test(t);
+  const dairy = /\b(cheese|cream|butter|milk|paneer|ghee|malai|makhani|dahi|raita|lassi|kulfi|rabri|ricotta|mascarpone|parmesan|parmigiano|burrata|mozzarella|fior di latte|yogurt|labneh|gelato|creme|anglaise|custard|pecorino)\b/.test(t);
   const egg = /\b(egg|eggs|aioli|mayo)\b/.test(t);
-  const gluten = /\b(bread|pasta|pappardelle|penne|spaghetti|pizza|dough|crust|toast|tart|tatin|brioche|flatbread|sourdough|cake)\b/.test(t);
-  const nuts = /\b(walnut|almond|pecan|hazelnut|pistachio|cashew|peanut)s?\b/.test(t);
+  const gluten = /\b(bread|breads|roti|chapati|naan|nan|paratha|kulcha|bhatura|puri|poori|samosa|pasta|pappardelle|penne|spaghetti|pizza|dough|crust|toast|tart|tatin|brioche|flatbread|sourdough|cake)\b/.test(t);
+  const nuts = /\b(walnut|almond|pecan|hazelnut|pistachio|cashew|peanut|kaju|badam)s?\b/.test(t);
+  const fish = /\b(fish|salmon|tuna|cod|hammour|pomfret|kingfish|anchov(y|ies))\b/.test(t);
+  const shellfish = /\b(prawns?|shrimps?|crab|lobster)\b/.test(t);
   let category = 'mains';
   if (/\b(soup|veloute|salad|tartare|bruschetta|carpaccio|starter|croquette)s?\b/.test(t)) category = 'starters';
-  if (/\b(tart|tatin|cake|mousse|gelato|sorbet|pudding|brulee|tiramisu|panna cotta|dessert)\b/.test(t)) category = 'desserts';
-  if (/\b(mocktail|cocktail|lemonade|juice|coffee|tea|soda|old fashioned|spritz|zero[- ]proof)\b/.test(t)) category = 'beverages';
+  if (/\b(tart|tatin|cake|mousse|gelato|sorbet|pudding|brulee|tiramisu|panna cotta|dessert|kheer|halwa|kulfi|gulab jamun|rasmalai|jalebi|kunafa|umm ali)\b/.test(t)) category = 'desserts';
+  if (/\b(mocktail|cocktail|lemonade|juice|coffee|tea|chai|lassi|soda|old fashioned|spritz|zero[- ]proof)\b/.test(t)) category = 'beverages';
   if (/\bpizza\b/.test(norm(name))) category = 'pizza';
-  const spicy = /\b(nduja|chili|chilli|harissa|jalapeno|peppercorn|spicy|vindaloo)\b/.test(t) ? 2 : /\b(pepper|smoked paprika|ginger)\b/.test(t) ? 1 : 0;
-  const allergens = [dairy && 'dairy', egg && 'egg', gluten && 'gluten', nuts && 'nuts'].filter(Boolean);
+  const spicy = /\b(nduja|chili|chilli|harissa|jalapeno|peppercorn|spicy|vindaloo|65|chettinad|kolhapuri|mirchi)\b/.test(t) ? 2
+    : /\b(pepper|smoked paprika|ginger|masala|biryani|tikka|curry|curries)\b/.test(t) ? 1 : 0;
+  const allergens = [dairy && 'dairy', egg && 'egg', gluten && 'gluten', nuts && 'nuts', fish && 'fish', shellfish && 'shellfish'].filter(Boolean);
   return {
     category, diet: nonveg ? 'nonveg' : 'veg', vegan: !nonveg && !dairy && !egg, gf: !gluten, spicy, allergens,
     meals: category === 'beverages' ? ['lunch', 'dinner'] : /\b(pancake|egg|toast|brunch)\b/.test(t) ? ['breakfast', 'lunch'] : ['lunch', 'dinner'],

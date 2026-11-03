@@ -1,4 +1,5 @@
-import { fmt, CATEGORIES, catLabel, RATE_LIMIT, MAX_TURN_MS, ALLERGENS, ALLERGEN_KEYS, parseMenuText, SAMPLE_EXTRACTION } from '../../shared/engine.js';
+import { fmt, CATEGORIES, CURRENCIES, currency, menuCategories, catLabel, RATE_LIMIT, MAX_TURN_MS, ALLERGENS, ALLERGEN_KEYS, SAMPLE_EXTRACTION } from '../../shared/engine.js';
+import { parseMenu, parseMenuText, linesFromPdf } from '../../shared/menuparse.js';
 import {
   useState, useEffect, useRef, useCallback, tableName, mmss, ago, modsText, Icon, DietMark, DishImage, Switch, chime,
   Toasts, api, useLive, useToasts, Brand, LiveBadge, Loading, useContext, RestaurantContext, useRestaurant, ServicePaused, serviceChanged,
@@ -23,7 +24,7 @@ function AdminApp() {
       <div className="min-h-full glass-bg">
         {!cfg ? <Loading label="Checking your staff session…" />
           : cfg.service.state === 'unlinked' ? <Connect />
-          : !cfg.service.active ? <ServicePaused state={cfg.service.state} staff />
+          : !cfg.service.active ? <ServicePaused state={cfg.service.state} staff><LeaveRestaurant restaurant={cfg.restaurant} /></ServicePaused>
           : auth === 'in' ? <Dashboard toast={toast} onLogout={logout} onExpired={() => setAuth('out')} service={cfg.service} />
           : auth === 'out' ? <Login onIn={() => setAuth('in')} licensed={cfg.service.state !== 'standalone'} /> : <Loading label="Checking your staff session…" />}
         <Toasts toasts={toasts} />
@@ -71,8 +72,9 @@ function Login({ onIn, licensed }) {
     try { await api('/api/admin/login', 'POST', { pin }); onIn(); } catch (x) { setErr(x.message); setPin(''); }
     setBusy(false);
   };
+  const { restaurant } = useContext(RestaurantContext);
   return (
-    <main className="gutter min-h-[100vh] flex items-center justify-center">
+    <main className="gutter min-h-[100vh] flex flex-col items-center justify-center">
       <form onSubmit={submit} className="w-full max-w-sm glass rounded-3xl p-8">
         <Brand sub="RESTAURANT STAFF" />
         <h1 className="font-serif text-3xl mt-8">Staff sign in</h1>
@@ -84,7 +86,40 @@ function Login({ onIn, licensed }) {
         <button disabled={!pin || (licensed && pin.length !== 6) || busy} className="btn-gold w-full justify-center mt-5 disabled:bg-[#CFC6B8]">{busy ? 'Signing in…' : 'Sign in'}</button>
         <p className="text-[12px] text-muted mt-5">Guests use the table tablets at /table/1, /table/2 and so on. They can't open this page.</p>
       </form>
+      {licensed && <div className="w-full max-w-sm text-center"><LeaveRestaurant restaurant={restaurant} /></div>}
     </main>
+  );
+}
+
+// Signs this computer out of its restaurant so another restaurant can connect. Without a staff session
+// it asks for the restaurant's username and password; its menu and orders stay saved on this computer.
+function LeaveRestaurant({ restaurant }) {
+  const [open, setOpen] = useState(false);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  if (!open) return <button type="button" onClick={() => setOpen(true)} className="text-[13px] text-gold-dark hover:underline mt-4">Not {restaurant}? Sign out of this restaurant</button>;
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setErr('');
+    try { await api('/api/admin/disconnect', 'POST', { username: username.trim(), password }); serviceChanged(); } catch (x) { setErr(x.message); setPassword(''); setBusy(false); }
+  };
+  const field = 'w-full bg-sand rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-gold/50';
+  return (
+    <form onSubmit={submit} className="glass rounded-3xl p-6 mt-4 text-left">
+      <h2 className="font-serif text-xl">Sign out of {restaurant}</h2>
+      <p className="text-[13px] text-muted mt-1">Enter {restaurant}'s username and password. Afterwards you can connect another restaurant; {restaurant}'s menu and orders stay saved on this computer.</p>
+      <label htmlFor="leave-user" className="label block mt-4 mb-1.5">Restaurant username</label>
+      <input id="leave-user" autoComplete="username" autoFocus value={username} onChange={(e) => setUsername(e.target.value.slice(0, 64))} className={field} />
+      <label htmlFor="leave-pass" className="label block mt-3 mb-1.5">Password</label>
+      <input id="leave-pass" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value.slice(0, 200))} className={field} />
+      {err && <p className="text-sm text-[#B5462E] mt-2" role="alert">{err}</p>}
+      <div className="flex gap-2 mt-4">
+        <button type="button" onClick={() => { setOpen(false); setErr(''); }} className="flex-1 rounded-full px-4 py-2.5 text-sm bg-sand">Cancel</button>
+        <button disabled={!username.trim() || !password || busy} className="btn-gold flex-1 justify-center disabled:bg-[#CFC6B8]">{busy ? 'Signing out…' : 'Sign out'}</button>
+      </div>
+    </form>
   );
 }
 
@@ -138,7 +173,8 @@ function Dashboard({ toast, onLogout, onExpired, service }) {
       switch (a.type) {
         case 'TOGGLE_86': return await api(`/api/admin/menu/${a.id}`, 'PATCH', { available: !a.available });
         case 'UPDATE_ITEM': return await api(`/api/admin/menu/${a.id}`, 'PATCH', a.patch);
-        case 'PUBLISH_ITEMS': return await api('/api/admin/menu', 'POST', { items: a.items });
+        case 'PUBLISH_ITEMS': return await api('/api/admin/menu', 'POST', a.body);
+        case 'DISH_PHOTO': return await api(`/api/admin/menu/${a.id}/photo`, 'POST', { action: a.action });
         case 'ADVANCE_ORDER': return await api(`/api/admin/orders/${a.id}/advance`, 'POST', {});
         case 'REQUEST_STATUS': return await api(`/api/admin/requests/${a.id}`, 'POST', { status: a.status });
         case 'SET_TABLE_OCCUPIED': return await api(`/api/admin/tables/${a.table}/occupancy`, 'PATCH', { occupied: a.occupied });
@@ -155,6 +191,10 @@ function Dashboard({ toast, onLogout, onExpired, service }) {
   const { restaurant } = useContext(RestaurantContext);
   useEffect(() => { document.title = `${restaurant} · ${{ kitchen: 'Kitchen', floor: 'Floor' }[VIEW] || 'Dashboard'}`; }, [restaurant]);
   const openRequests = snap ? snap.requests.filter((r) => r.status === 'open').length : 0;
+  const leaveRestaurant = async () => {
+    if (!window.confirm(`Sign this computer out of ${restaurant}? Tablets and staff screens stop until a restaurant connects again. ${restaurant}'s menu and orders stay saved here.`)) return;
+    try { await api('/api/admin/disconnect', 'POST', {}); serviceChanged(); } catch (x) { toast(x.message, 'warn'); }
+  };
   if (VIEW === 'kitchen') return snap ? <KitchenScreen state={snap} dispatch={dispatch} now={now} online={online} sound={sound} setSound={setSound} /> : <Loading label="Loading tonight's tickets…" />;
   if (VIEW === 'floor') return snap ? <FloorView state={snap} dispatch={dispatch} now={now} online={online} sound={sound} setSound={setSound} onLogout={onLogout} service={service} /> : <Loading label="Loading tables…" />;
   return (
@@ -167,6 +207,7 @@ function Dashboard({ toast, onLogout, onExpired, service }) {
           <a href="/floor" target="_blank" rel="noopener" className="flex items-center gap-1.5 text-sm text-muted hover:text-ink"><Icon name="phone" className="w-4 h-4" />Floor view</a>
           <SoundToggle sound={sound} setSound={setSound} />
           <LiveBadge online={online} />
+          {service.state !== 'standalone' && <button onClick={leaveRestaurant} className="flex items-center gap-1.5 text-sm text-muted hover:text-ink" title={`Sign this computer out of ${restaurant}`}><Icon name="link" className="w-4 h-4" />Switch restaurant</button>}
           <button onClick={onLogout} className="flex items-center gap-1.5 text-sm text-muted hover:text-ink"><Icon name="logout" className="w-4 h-4" />Sign out</button>
         </nav>
         <ServiceNotice service={service} />
@@ -308,7 +349,7 @@ function Admin({ state, dispatch, now, toast, activeOrders, openRequests }) {
   const offCount = state.menu.filter((m) => !m.available).length;
   const blocks = state.security.length;
   const busyTables = state.tables.filter((t) => state.occupancy?.[t]).length;
-  const tabs = [['orders', 'Live Orders', activeOrders], ['tables', 'Tables', null], ['menu', 'Menu Control', null], ['ingest', 'AI Menu Ingestor', null], ['requests', 'Service Requests', openRequests], ['security', 'Security Log', blocks]];
+  const tabs = [['orders', 'Live Orders', activeOrders], ['tables', 'Tables', null], ['menu', 'Menu Control', null], ['ingest', 'Import Menu', null], ['requests', 'Service Requests', openRequests], ['security', 'Security Log', blocks]];
   const kpis = [
     ['Active orders', activeOrders, `${state.orders.filter((o) => o.status === 'kitchen').length} in the kitchen`],
     ['Open requests', openRequests, 'Server calls and bills'],
@@ -346,7 +387,7 @@ function Admin({ state, dispatch, now, toast, activeOrders, openRequests }) {
         <div className="mt-5">
           {tab === 'orders' && <OrderQueue orders={state.orders} dispatch={dispatch} now={now} undoMs={state.undoMs} />}
           {tab === 'tables' && <TablesView state={state} now={now} dispatch={dispatch} toast={toast} />}
-          {tab === 'menu' && <MenuControl menu={state.menu} dispatch={dispatch} toast={toast} />}
+          {tab === 'menu' && <MenuControl menu={state.menu} photosPending={state.photosPending} dispatch={dispatch} toast={toast} />}
           {tab === 'ingest' && <Ingestor dispatch={dispatch} toast={toast} menu={state.menu} onDone={() => setTab('menu')} />}
           {tab === 'requests' && <Requests requests={state.requests} allergenLog={state.allergenLog || []} dispatch={dispatch} now={now} />}
           {tab === 'security' && <SecurityLog entries={state.security} now={now} />}
@@ -401,12 +442,12 @@ function PriceInput({ item, dispatch, toast }) {
   useEffect(() => setV(item.price.toFixed(2)), [item.price]);
   const commit = () => {
     const n = Math.round(parseFloat(v) * 100) / 100;
-    if (!isFinite(n) || n < 0.5 || n > 500) { toast('Enter a price between $0.50 and $500.', 'danger'); setV(item.price.toFixed(2)); return; }
+    if (!isFinite(n) || n < 0.5 || n > 100000) { toast(`Enter a price between ${fmt(0.5)} and ${fmt(100000)}.`, 'danger'); setV(item.price.toFixed(2)); return; }
     if (n !== item.price) dispatch({ type: 'UPDATE_ITEM', id: item.id, patch: { price: n } }).then((ok) => ok ? toast(`${item.name} now ${fmt(n)} on all tablets.`) : setV(item.price.toFixed(2)));
   };
   return (
     <div className="flex items-center bg-sand rounded-lg pl-2 w-[92px]">
-      <span className="text-muted text-sm">$</span>
+      <span className="text-muted text-[12px]">{CURRENCIES[currency()].trim()}</span>
       <input id={`price-${item.id}`} aria-label={`Price of ${item.name}`} value={v} onChange={(e) => setV(e.target.value.replace(/[^0-9.]/g, ''))} onBlur={commit} onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
         className="w-full bg-transparent px-1 py-1.5 text-sm tabular-nums focus:outline-none" inputMode="decimal" />
     </div>
@@ -453,6 +494,7 @@ function DishDetails({ item, menu, dispatch, toast }) {
         </label>
       </div>
       <div className="flex flex-col gap-3">
+        <DishPhoto item={item} dispatch={dispatch} toast={toast} />
         <label className="block">
           <span className="label block mb-1">Suggest with this dish</span>
           <select value={item.pairWith || ''} onChange={(e) => set({ pairWith: e.target.value || null }, e.target.value ? 'The assistant will suggest it once per order.' : 'No pairing suggested.')} className="w-full bg-sand rounded-lg px-2 py-1.5 text-sm">
@@ -472,7 +514,31 @@ function DishDetails({ item, menu, dispatch, toast }) {
   );
 }
 
-function MenuControl({ menu, dispatch, toast }) {
+// The dish's photo: find one on Wikipedia (or a different one), or remove it.
+function DishPhoto({ item, dispatch, toast }) {
+  const [busy, setBusy] = useState(false);
+  const act = async (action) => {
+    setBusy(true);
+    const ok = await dispatch({ type: 'DISH_PHOTO', id: item.id, action });
+    setBusy(false);
+    if (ok) toast(action === 'remove' ? `${item.name} now shows without a photo.` : `New photo for ${item.name}.`);
+  };
+  return (
+    <div>
+      <span className="label block mb-1">Photo</span>
+      <div className="flex items-center gap-3">
+        <div className="w-16 h-12 rounded-lg overflow-hidden shrink-0"><DishImage item={item} /></div>
+        <div className="flex flex-wrap gap-x-3 gap-y-1 text-[13px]">
+          <button disabled={busy} onClick={() => act('find')} className="text-gold-dark hover:underline disabled:opacity-50">{busy ? 'Searching…' : item.img ? 'Find another photo' : 'Find a photo'}</button>
+          {item.img && <button disabled={busy} onClick={() => act('remove')} className="text-muted hover:text-[#B5462E]">Remove photo</button>}
+          {item.imgCredit && <a href={item.imgCredit} target="_blank" rel="noopener noreferrer" className="text-muted hover:underline">Photo credit and licence</a>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MenuControl({ menu, photosPending, dispatch, toast }) {
   const [q, setQ] = useState('');
   const [cat, setCat] = useState('all');
   const [open, setOpen] = useState(null);
@@ -483,8 +549,9 @@ function MenuControl({ menu, dispatch, toast }) {
       <div className="p-3 sm:p-4 flex flex-wrap gap-2 items-center border-b border-line">
         <input id="menu-search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search dishes" aria-label="Search dishes" className="bg-sand rounded-full px-4 py-2 text-sm flex-1 min-w-[160px] focus:outline-none focus:ring-2 focus:ring-gold/50" />
         <select id="menu-cat" value={cat} onChange={(e) => setCat(e.target.value)} aria-label="Category" className="bg-sand rounded-full px-3 py-2 text-sm">
-          {CATEGORIES.filter((c) => c.id !== 'specials').map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+          {menuCategories(menu).filter((c) => c.id !== 'specials').map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
         </select>
+        {photosPending > 0 && <p className="text-[12.5px] text-muted flex items-center gap-2"><span className="w-3.5 h-3.5 rounded-full border-2 border-gold border-t-transparent animate-spin" />Finding dish photos: {photosPending} to go</p>}
         {unchecked > 0 && <p className="basis-full text-[12.5px] text-[#7A4B06]">{unchecked} dish{unchecked === 1 ? '' : 'es'} still need the kitchen to confirm allergens. Open <strong>Details</strong> on each one.</p>}
       </div>
       <div className="overflow-x-auto">
@@ -529,42 +596,88 @@ function MenuControl({ menu, dispatch, toast }) {
   );
 }
 
-const STAGES = ['Upload received', 'Page layout & OCR', 'Vision-LLM dish extraction', 'Tag & allergen inference', 'Schema validation'];
+// PDF.js is large, so it loads only when a PDF is dropped; its worker reads the file off the main thread.
+let pdfjs = null;
+async function readPdf(file) {
+  if (!pdfjs) {
+    const url = '/assets/vendor/pdfjs/pdf.min.mjs';
+    pdfjs = await import(url);
+    pdfjs.GlobalWorkerOptions.workerSrc = '/assets/vendor/pdfjs/pdf.worker.min.mjs';
+  }
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false }).promise;
+  const pages = [];
+  for (let n = 1; n <= Math.min(doc.numPages, 30); n++) {
+    const page = await doc.getPage(n);
+    const text = await page.getTextContent();
+    pages.push({
+      width: page.getViewport({ scale: 1 }).width,
+      items: text.items.filter((it) => 'str' in it).map((it) => ({ str: it.str, x: it.transform[4], y: it.transform[5], h: it.height || Math.abs(it.transform[3]), w: it.width })),
+    });
+  }
+  return pages;
+}
+
+const NO_TEXT = "This file has no readable text, so it looks like a scan or a photo. Upload the menu as a PDF with selectable text (as most menu designers and online menus export it), or as a .txt list: one dish per line with its price, and each section's name on its own line.";
+const symbol = (code) => CURRENCIES[code].trim();
+// The built-in sample dishes a new restaurant starts with; an imported menu replaces them by default.
+const isSampleMenu = (menu) => menu.length > 0 && menu.every((m) => !m.id.startsWith('dish-'));
+
 function Ingestor({ dispatch, toast, menu, onDone }) {
   const [file, setFile] = useState(null);
-  const [stage, setStage] = useState(-1);
+  const [reading, setReading] = useState(false);
+  const [found, setFound] = useState(null); // { title, sections }
   const [rows, setRows] = useState(null);
+  const [cur, setCur] = useState(currency());
+  const [replace, setReplace] = useState(null);
+  const [photos, setPhotos] = useState(null); // 'web' | 'none', asked every time
   const [drag, setDrag] = useState(false);
+  const [error, setError] = useState('');
   const inputRef = useRef(null);
 
-  const run = (f, textRows) => {
-    setFile(f); setRows(null); setStage(0);
-    STAGES.forEach((_, i) => setTimeout(() => setStage(i + 1), 650 * (i + 1)));
-    setTimeout(() => setRows((textRows && textRows.length ? textRows : SAMPLE_EXTRACTION).map((r) => ({ key: Math.random(), ...r }))), 650 * STAGES.length + 100);
+  const reset = () => { setRows(null); setFound(null); setFile(null); setError(''); setPhotos(null); setReplace(null); };
+  const show = (f, result) => {
+    if (!result.rows.length) { setError(NO_TEXT); setRows(null); return; }
+    setFound({ title: result.title, sections: result.sections });
+    setCur(result.currency && CURRENCIES[result.currency] ? result.currency : currency());
+    setReplace(isSampleMenu(menu) ? true : null);
+    setPhotos(null);
+    setRows(result.rows.map((r) => ({ key: Math.random(), ...r })));
   };
-  const handle = (f) => {
+  const handle = async (f) => {
     if (!f) return;
     const isText = /\.(txt|csv|md)$/i.test(f.name) || /^text\//.test(f.type);
-    const ok = isText || /\.(pdf|png|jpe?g|webp|heic)$/i.test(f.name);
-    if (!ok) { toast('Upload a PDF, image, or .txt/.csv menu.', 'danger'); return; }
+    const isPdf = /\.pdf$/i.test(f.name) || f.type === 'application/pdf';
+    if (/\.(png|jpe?g|webp|heic)$/i.test(f.name) || /^image\//.test(f.type)) { setFile(f); setRows(null); setError(NO_TEXT); return; }
+    if (!isText && !isPdf) { toast('Upload a PDF, or a .txt/.csv menu.', 'danger'); return; }
     if (f.size > 20 * 1024 * 1024) { toast('That file is over 20 MB.', 'danger'); return; }
-    if (isText) { const r = new FileReader(); r.onload = () => run({ name: f.name, size: f.size, kind: 'text' }, parseMenuText(String(r.result))); r.readAsText(f); }
-    else run({ name: f.name, size: f.size, kind: 'visual' });
+    setFile(f); setRows(null); setError(''); setReading(true);
+    try {
+      show(f, isText ? parseMenuText(await f.text()) : parseMenu(linesFromPdf(await readPdf(f))));
+    } catch (e) {
+      console.error(e);
+      setError("This PDF couldn't be read. If it's password-protected, save an unprotected copy and try again.");
+    }
+    setReading(false);
   };
   const upd = (key, patch) => setRows((rs) => rs.map((r) => (r.key === key ? { ...r, ...patch } : r)));
-  const invalid = (r) => !r.name.trim() || !(r.price > 0 && r.price <= 500) || menu.some((m) => m.name.toLowerCase() === r.name.trim().toLowerCase());
+  const renameSection = (id, label) => setFound((f) => ({ ...f, sections: f.sections.map((s) => (s.id === id ? { ...s, label } : s)) }));
+  const onMenu = (r) => !replace && menu.some((m) => m.name.toLowerCase() === r.name.trim().toLowerCase());
+  const invalid = (r) => !r.name.trim() || !(r.price >= 0.5 && r.price <= 100000) || onMenu(r);
+  const used = found ? found.sections.filter((s) => rows && rows.some((r) => r.category === s.id)) : [];
+  const categoryOptions = [...used, ...CATEGORIES.filter((c) => !['all', 'specials'].includes(c.id))];
   const [publishing, setPublishing] = useState(false);
+  const blocked = publishing || !rows || !rows.length || rows.some(invalid) || rows.some((r) => !r.meals.length) || replace === null || !photos || used.some((s) => !s.label.trim());
   const publish = async () => {
     const items = rows.map((r) => ({
-      name: r.name.trim(), desc: r.desc, category: r.category, price: Math.round(r.price * 100) / 100,
+      name: r.name.trim(), desc: r.desc, category: r.category, price: Math.round(r.price * 100) / 100, aliases: r.aliases || [],
       diet: r.diet, vegan: r.vegan, gf: r.gf, spicy: r.spicy, meals: r.meals, allergens: r.allergens,
     }));
     setPublishing(true);
-    const res = await dispatch({ type: 'PUBLISH_ITEMS', items });
+    const res = await dispatch({ type: 'PUBLISH_ITEMS', body: { items, sections: used.map((s) => ({ id: s.id, label: s.label.trim() })), currency: cur, replace, photos } });
     setPublishing(false);
     if (!res) return;
-    toast(`Published ${res.added} dishes to every table tablet.`);
-    setRows(null); setStage(-1); setFile(null);
+    toast(`Published ${res.added} dishes to every table tablet.${photos === 'web' ? ' Photos are being added; they appear as each one is found.' : ''}`);
+    reset();
     onDone();
   };
 
@@ -576,22 +689,16 @@ function Ingestor({ dispatch, toast, menu, onDone }) {
           className={'rounded-2xl border-2 border-dashed p-6 text-center cursor-pointer transition ' + (drag ? 'border-gold bg-gold-wash' : 'border-line bg-white hover:border-gold')}>
           <div className="mx-auto w-12 h-12 rounded-full bg-gold-wash text-gold-dark flex items-center justify-center"><Icon name="upload" className="w-6 h-6" /></div>
           <p className="font-serif text-lg mt-3">Drop your menu here</p>
-          <p className="text-[12.5px] text-muted mt-1">PDF, JPG, PNG or a .txt/.csv price list, up to 20 MB</p>
-          <input ref={inputRef} id="menu-file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,.heic,.txt,.csv,.md,image/*,application/pdf,text/plain" className="hidden" onChange={(e) => { handle(e.target.files[0]); e.target.value = ''; }} />
+          <p className="text-[12.5px] text-muted mt-1">A PDF menu, or a .txt/.csv price list, up to 20 MB</p>
+          <input ref={inputRef} id="menu-file" type="file" accept=".pdf,.txt,.csv,.md,application/pdf,text/plain" className="hidden" onChange={(e) => { handle(e.target.files[0]); e.target.value = ''; }} />
         </div>
-        <button onClick={() => run({ name: 'autumn-harvest-menu.pdf', size: 2.4 * 1024 * 1024, kind: 'visual' })} className="btn-outline justify-center">Try the sample autumn menu (PDF)</button>
-        <p className="text-[11.5px] text-muted leading-relaxed">Demo pipeline: text menus are parsed line by line in the browser. PDFs and photos return a simulated vision-model extraction. Every row is checked against the menu schema before it can be published.</p>
-        {stage >= 0 && (
-          <div className="glass rounded-2xl p-4">
-            <p className="label mb-3">{file.name} · {(file.size / 1024 / 1024).toFixed(1)} MB</p>
-            <ol className="flex flex-col gap-2.5">
-              {STAGES.map((s, i) => (
-                <li key={s} className="flex items-center gap-2.5 text-sm">
-                  <span className={'w-5 h-5 rounded-full flex items-center justify-center shrink-0 ' + (stage > i ? 'bg-veg text-white' : stage === i ? 'border-2 border-gold border-t-transparent animate-spin' : 'border border-line')}>{stage > i && <Icon name="check" className="w-3 h-3" />}</span>
-                  <span className={stage >= i ? 'text-ink' : 'text-muted'}>{s}</span>
-                </li>
-              ))}
-            </ol>
+        <button onClick={() => { setFile({ name: 'Sample menu' }); setError(''); show(null, { title: null, currency: null, sections: [], rows: SAMPLE_EXTRACTION }); }} className="btn-outline justify-center">Try a sample menu</button>
+        <p className="text-[11.5px] text-muted leading-relaxed">The menu is read on this computer. Its sections become the tablet's categories, in the menu's order; prices keep the menu's currency. Diet tags, spice and allergens are suggestions to check. Scanned menus and photos can't be read yet.</p>
+        {file && (reading || error) && (
+          <div className="glass rounded-2xl p-4" role={error ? 'alert' : 'status'}>
+            <p className="label mb-2">{file.name}</p>
+            {reading ? <p className="text-sm flex items-center gap-2"><span className="w-4 h-4 rounded-full border-2 border-gold border-t-transparent animate-spin" />Reading the menu…</p>
+              : <p className="text-sm text-[#8A2E1C]">{error}</p>}
           </div>
         )}
       </div>
@@ -599,37 +706,79 @@ function Ingestor({ dispatch, toast, menu, onDone }) {
       <div className="min-w-0">
         {!rows ? (
           <div className="glass rounded-2xl p-8 text-center">
-            <p className="font-serif text-xl">{stage >= 0 ? 'Reading your menu…' : 'Extracted dishes will appear here'}</p>
-            <p className="text-sm text-muted mt-1 max-w-md mx-auto">Names, descriptions, prices, diet tags, spice level, allergens and meal times are pulled into an editable table for you to check before publishing.</p>
+            <p className="font-serif text-xl">{reading ? 'Reading your menu…' : 'Dishes from your menu will appear here'}</p>
+            <p className="text-sm text-muted mt-1 max-w-md mx-auto">Sections, dish names, descriptions and prices are pulled into an editable table for you to check before publishing.</p>
           </div>
         ) : (
           <div className="glass rounded-2xl">
-            <div className="p-4 flex flex-wrap items-center justify-between gap-3 border-b border-line">
+            <div className="p-4 flex flex-wrap items-start justify-between gap-3 border-b border-line">
               <div>
-                <p className="font-serif text-xl">{rows.length} dishes extracted</p>
-                <p className="text-[12.5px] text-muted">Review and edit, then publish. Rows under 80% confidence are highlighted.</p>
+                <p className="font-serif text-xl">{rows.length} dishes{used.length ? ` in ${used.length} section${used.length === 1 ? '' : 's'}` : ''}{found.title ? ` · ${found.title}` : ''}</p>
+                <p className="text-[12.5px] text-muted">Check each row, answer the questions below, then publish. Highlighted rows need a look.</p>
               </div>
               <div className="flex gap-2">
-                <button onClick={() => { setRows(null); setStage(-1); setFile(null); }} className="btn-outline py-2">Discard</button>
-                <button onClick={publish} disabled={publishing || !rows.length || rows.some(invalid) || rows.some((r) => !r.meals.length)} className="btn-gold py-2 disabled:bg-[#CFC6B8] disabled:cursor-not-allowed">Approve & Publish to Tablets</button>
+                <button onClick={reset} className="btn-outline py-2">Discard</button>
+                <button onClick={publish} disabled={blocked} className="btn-gold py-2 disabled:bg-[#CFC6B8] disabled:cursor-not-allowed">{publishing ? 'Publishing…' : 'Approve & Publish to Tablets'}</button>
               </div>
             </div>
+
+            <div className="p-4 grid md:grid-cols-2 gap-4 border-b border-line">
+              <fieldset className="flex flex-col gap-1.5">
+                <legend className="label mb-1.5">Dish photos</legend>
+                <p className="text-[12.5px] text-muted">This menu has no photo for each dish. Do you want photos on the tablets?</p>
+                {[['web', 'Yes, add a photo of each dish from the internet', 'Free-licensed photos from Wikipedia, matched to each dish name and saved on this computer. You can change or remove any of them in Menu Control.'],
+                  ['none', 'No photos', 'Dishes show their name on a plain plate instead.']].map(([v, label, hint]) => (
+                  <label key={v} className="flex items-start gap-2 text-sm cursor-pointer">
+                    <input type="radio" name="photos" className="mt-1 accent-[#B07A2A]" checked={photos === v} onChange={() => setPhotos(v)} />
+                    <span>{label}<span className="block text-[12px] text-muted">{hint}</span></span>
+                  </label>
+                ))}
+              </fieldset>
+              <div className="flex flex-col gap-3">
+                <fieldset className="flex flex-col gap-1.5">
+                  <legend className="label mb-1.5">Your current menu ({menu.length} dishes)</legend>
+                  {[[true, 'Replace it with this menu', isSampleMenu(menu) ? 'Recommended: the current menu is the sample menu.' : 'Every current dish is removed and carts are emptied. Orders already sent are kept.'],
+                    [false, 'Add these dishes to it', 'Dishes already on the menu are skipped.']].map(([v, label, hint]) => (
+                    <label key={String(v)} className="flex items-start gap-2 text-sm cursor-pointer">
+                      <input type="radio" name="replace" className="mt-1 accent-[#B07A2A]" checked={replace === v} onChange={() => setReplace(v)} />
+                      <span>{label}<span className="block text-[12px] text-muted">{hint}</span></span>
+                    </label>
+                  ))}
+                </fieldset>
+                <label className="flex items-center gap-2 text-sm">
+                  <span className="label">Currency</span>
+                  <select value={cur} onChange={(e) => setCur(e.target.value)} className="bg-sand rounded-lg px-2 py-1.5">
+                    {Object.keys(CURRENCIES).map((c) => <option key={c} value={c}>{c} ({symbol(c)})</option>)}
+                  </select>
+                  {cur !== currency() && <span className="text-[12px] text-muted">All prices will show in {cur}.</span>}
+                </label>
+              </div>
+              {used.length > 0 && (
+                <div className="md:col-span-2">
+                  <p className="label mb-1.5">Sections (the tablet's categories, in this order)</p>
+                  <div className="flex flex-wrap gap-2">
+                    {used.map((s) => <input key={s.id} aria-label="Section name" value={s.label} onChange={(e) => renameSection(s.id, e.target.value.slice(0, 48))} className="bg-sand rounded-lg px-2.5 py-1.5 text-sm w-[220px] focus:outline-none focus:ring-2 focus:ring-gold/50" />)}
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div className="overflow-x-auto">
               <table className="w-full text-sm min-w-[980px]">
                 <thead><tr className="text-left text-muted text-[11.5px] uppercase tracking-wider">
-                  <th className="font-medium px-3 py-2.5">Dish & description</th><th className="font-medium px-2">Price</th><th className="font-medium px-2">Category</th><th className="font-medium px-2">Diet & spice</th><th className="font-medium px-2">Allergens</th><th className="font-medium px-2">Meals</th><th className="font-medium px-2">Conf.</th><th className="px-2" />
+                  <th className="font-medium px-3 py-2.5">Dish & description</th><th className="font-medium px-2">Price</th><th className="font-medium px-2">Section</th><th className="font-medium px-2">Diet & spice</th><th className="font-medium px-2">Allergens</th><th className="font-medium px-2">Meals</th><th className="font-medium px-2">Conf.</th><th className="px-2" />
                 </tr></thead>
                 <tbody className="divide-y divide-line align-top">
                   {rows.map((r) => (
-                    <tr key={r.key} className={r.conf < 0.8 ? 'bg-[#FFF8EC]' : invalid(r) ? 'bg-[#FDF1EE]' : ''}>
+                    <tr key={r.key} className={invalid(r) ? 'bg-[#FDF1EE]' : r.conf < 0.8 ? 'bg-[#FFF8EC]' : ''}>
                       <td className="px-3 py-2.5 min-w-[260px]">
                         <input aria-label="Dish name" value={r.name} onChange={(e) => upd(r.key, { name: e.target.value })} className="cell font-medium" />
-                        <textarea aria-label="Description" value={r.desc} rows={2} onChange={(e) => upd(r.key, { desc: e.target.value })} className="cell text-[12.5px] text-muted mt-1 resize-none" />
-                        {r.lowConf && <p className="text-[11.5px] text-[#7A4B06] mt-1">{r.lowConf}</p>}
-                        {menu.some((m) => m.name.toLowerCase() === r.name.trim().toLowerCase()) && <p className="text-[11.5px] text-[#B5462E] mt-1">Already on the menu</p>}
+                        <textarea aria-label="Description" value={r.desc} rows={2} placeholder="No description on the menu" onChange={(e) => upd(r.key, { desc: e.target.value })} className="cell text-[12.5px] text-muted mt-1 resize-none" />
+                        {(r.priceNote || r.lowConf) && <p className="text-[11.5px] text-[#7A4B06] mt-1">{r.priceNote || r.lowConf}</p>}
+                        {onMenu(r) && <p className="text-[11.5px] text-[#B5462E] mt-1">Already on the menu</p>}
                       </td>
-                      <td className="px-2 py-2.5"><div className="flex items-center bg-sand rounded-lg pl-2 w-[84px]"><span className="text-muted">$</span><input aria-label="Price" value={r.price} inputMode="decimal" onChange={(e) => upd(r.key, { price: parseFloat(e.target.value.replace(/[^0-9.]/g, '')) || 0 })} className="w-full bg-transparent px-1 py-1.5 tabular-nums focus:outline-none" /></div></td>
-                      <td className="px-2 py-2.5"><select aria-label="Category" value={r.category} onChange={(e) => upd(r.key, { category: e.target.value })} className="bg-sand rounded-lg px-2 py-1.5">{CATEGORIES.filter((c) => !['all', 'specials'].includes(c.id)).map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}</select></td>
+                      <td className="px-2 py-2.5"><div className="flex items-center bg-sand rounded-lg pl-2 w-[104px]"><span className="text-muted text-[12px]">{symbol(cur)}</span><input aria-label="Price" value={r.price} inputMode="decimal" onChange={(e) => upd(r.key, { price: parseFloat(e.target.value.replace(/[^0-9.]/g, '')) || 0, priceNote: '' })} className="w-full bg-transparent px-1 py-1.5 tabular-nums focus:outline-none" /></div></td>
+                      <td className="px-2 py-2.5"><select aria-label="Section" value={r.category} onChange={(e) => upd(r.key, { category: e.target.value })} className="bg-sand rounded-lg px-2 py-1.5 max-w-[190px]">{categoryOptions.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}</select></td>
                       <td className="px-2 py-2.5">
                         <div className="flex flex-wrap gap-1 w-[180px]">
                           <button onClick={() => upd(r.key, { diet: r.diet === 'veg' ? 'nonveg' : 'veg', vegan: false })} className="mini-chip mini-chip-on"><DietMark diet={r.diet} />{r.diet === 'veg' ? 'Veg' : 'Non-Veg'}</button>

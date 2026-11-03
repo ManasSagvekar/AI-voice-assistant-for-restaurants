@@ -1,12 +1,14 @@
 // Nightly copies of the restaurant database: menu, orders, settings and the licence link all live in
 // one SQLite file, so a dead disk would otherwise lose everything. Keeps the newest BACKUP_KEEP copies
 // in BACKUP_DIR, and optionally a second set in BACKUP_COPY_DIR (a USB drive or a synced cloud folder).
+// `dir` and `copyDir` may be functions, for a folder that depends on the restaurant signed in.
 import { copyFileSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 
 const NAME = /^flavoria-\d{4}-\d{2}-\d{2}-\d{6}\.db$/;
 
-export function createBackups(store, { dir, copyDir, keep = 14, hour = 3 }) {
+export function createBackups(store, { dir: dirOption, copyDir: copyOption, keep = 14, hour = 3 }) {
+  const resolve = (d) => (typeof d === 'function' ? d() : d);
   const last = () => { try { return JSON.parse(store.setting('last_backup') || 'null'); } catch { return null; } };
 
   function prune(folder) {
@@ -16,6 +18,8 @@ export function createBackups(store, { dir, copyDir, keep = 14, hour = 3 }) {
 
   function run() {
     const started = Date.now();
+    const dir = resolve(dirOption);
+    const copyDir = resolve(copyOption);
     try {
       mkdirSync(dir, { recursive: true });
       const d = new Date();
@@ -50,5 +54,5 @@ export function createBackups(store, { dir, copyDir, keep = 14, hour = 3 }) {
     setInterval(() => { if (new Date().getHours() === hour && due()) run(); }, 10 * 60e3).unref();
   }
 
-  return { run, start, status: () => ({ ...(last() || {}), dir, copyDir: copyDir || null, keep }) };
+  return { run, start, status: () => ({ ...(last() || {}), dir: resolve(dirOption), copyDir: resolve(copyOption) || null, keep }) };
 }

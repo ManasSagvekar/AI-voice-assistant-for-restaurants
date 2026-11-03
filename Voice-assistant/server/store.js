@@ -90,19 +90,38 @@ export function createStore(file) {
     return next;
   });
 
-  const publishItems = tx((rows) => {
+  const insertItems = (rows) => {
     let sort = q('SELECT COALESCE(MAX(sort), 0) s FROM menu_items').get().s;
     const taken = new Set(menu().map((m) => m.name.toLowerCase()));
     const added = [];
     for (const r of rows) {
       if (taken.has(r.name.toLowerCase())) continue;
       taken.add(r.name.toLowerCase());
-      const m = { ...r, id: id('dish-').toLowerCase(), rating: null, reviews: 0, prep: 15, img: null, aliases: [], available: true, isNew: true };
+      const m = { aliases: [], ...r, id: id('dish-').toLowerCase(), rating: null, reviews: 0, prep: 15, img: null, available: true, isNew: true };
       q('INSERT INTO menu_items (id, sort, data) VALUES (?, ?, ?)').run(m.id, ++sort, json(m));
       added.push(m);
     }
     return added;
+  };
+  const publishItems = tx(insertItems);
+  // An imported menu that replaces the whole menu. Carts held the old dishes, so they are emptied;
+  // orders already sent keep their own copy of each line.
+  const replaceMenu = tx((rows) => {
+    q('DELETE FROM menu_items').run();
+    q('DELETE FROM cart_lines').run();
+    return insertItems(rows);
   });
+
+  // The restaurant's currency and its imported menu sections ([{ id, label }]).
+  const menuMeta = () => {
+    let sections = [];
+    try { sections = JSON.parse(setting('menu_sections') || '[]'); } catch { /* keep none */ }
+    return { currency: setting('currency') || 'USD', sections };
+  };
+  const setMenuMeta = ({ currency, sections }) => {
+    if (currency) setting('currency', currency);
+    if (sections) setting('menu_sections', JSON.stringify(sections));
+  };
 
   // ---------- carts ----------
   const cart = (table) => q('SELECT id, item_id, qty, mods FROM cart_lines WHERE table_id = ? ORDER BY created_at')
@@ -242,7 +261,7 @@ export function createStore(file) {
   const backupTo = (file) => db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
 
   return {
-    db, menu, item, updateItem, publishItems, cart, note, addToCart, changeQty, removeLine, removeItem, setNote, resetTable,
+    db, menu, item, updateItem, publishItems, replaceMenu, menuMeta, setMenuMeta, cart, note, addToCart, changeQty, removeLine, removeItem, setNote, resetTable,
     tableOrders, recentOrders, placeOrder, cancelOrder, latestOrder, advanceOrder, requests, addRequest, setRequestStatus, tableStatuses, setTableOccupied,
     logSecurity, security, setting, addSession, hasSession, dropSession, dropAllSessions,
     logAllergen, allergenLog, backupTo, categories: CATEGORIES,

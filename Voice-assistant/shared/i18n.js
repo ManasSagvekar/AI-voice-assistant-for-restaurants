@@ -289,9 +289,3 @@ export const LABELS = {
   },
 };
 export const labels = (lang) => LABELS[lang] || LABELS.en;
-
-// Example phrases shown under the assistant. Hindi and Marathi ones are hints to say aloud.
-export const EXAMPLES = {
-  hi: ['मसालेदार शाकाहारी मेन क्या है?', 'दो मैंगो मॉकटेल और एक तिरामिसु', 'क्या तिरामिसु में मेवे हैं?', 'बिल ले आइए, तीन हिस्सों में'],
-  mr: ['तिखट शाकाहारी मेन काय आहे?', 'दोन मँगो मॉकटेल आणि एक तिरामिसू', 'तिरामिसूमध्ये सुकामेवा आहे का?', 'बिल आणा, तीन भागांत'],
-};

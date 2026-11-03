@@ -1,23 +1,32 @@
 import {
-  IDLE_LIMIT, WARN_AT, MAX_TURN_MS, LONG_TURN_MS, RATE_LIMIT, TAX_RATE, UNDO_MS, fmt, CATEGORIES, MODIFIERS, ALLERGENS, allowedMods, priceLine, totals,
+  IDLE_LIMIT, WARN_AT, MAX_TURN_MS, LONG_TURN_MS, RATE_LIMIT, TAX_RATE, UNDO_MS, fmt, CATEGORIES, CURRENCIES, currency, menuCategories, catLabel, MODIFIERS, ALLERGENS, allowedMods, priceLine, totals,
   EMPTY_FILTERS, matchesFilters, describeFilters, sanitizeTranscript, upsellFor,
 } from '../../shared/engine.js';
-import { LANGS, ui, labels, dishName, allergenName, EXAMPLES } from '../../shared/i18n.js';
+import { LANGS, ui, labels, dishName, allergenName } from '../../shared/i18n.js';
 import {
   useState, useEffect, useRef, useMemo, useCallback, createContext, tableName, mmss, modsText, Icon, Chili, DietMark, DishImage, Waveform,
   VOICE_LABEL, Toasts, StatusPill, api, useLive, useToasts, Brand, LiveBadge, Loading, chime,
   useContext, RestaurantContext, useRestaurant, ServicePaused, serviceChanged,
 } from '../../client/ui.jsx';
 
-const SAMPLE_PHRASES = [
-  'Show me spicy vegetarian main courses for lunch',
-  'Add Truffle Mushroom Risotto, extra cheese, no garlic',
-  'Two mango passion mocktails and a classic tiramisu',
-  'Does the tiramisu have nuts?',
-  'Something gluten-free under $30',
-  'Call a server please',
-  'Request the bill, split three ways',
-];
+// Example requests built from tonight's menu, so they always name real dishes and the right currency.
+function samplePhrases(menu, lang) {
+  const dishes = menu.filter((m) => m.available);
+  const [a, b, c] = dishes;
+  const asked = dishes.find((m) => m.allergensChecked) || dishes[3] || a;
+  const name = (m) => dishName(m, lang);
+  const prices = dishes.map((m) => m.price).sort((x, y) => x - y);
+  const limit = prices.length ? Math.max(5, Math.ceil(prices[Math.floor(prices.length / 2)] / 5) * 5) : 30;
+  const sym = CURRENCIES[currency()].trim();
+  const under = sym.length > 1 ? `${sym} ${limit}` : sym + limit;
+  const phrases = {
+    en: ['Show me something spicy and vegetarian', a && `Add ${name(a)}`, b && c && `Two ${name(b)} and a ${name(c)}`,
+      asked && `Does the ${name(asked)} have nuts?`, `Something gluten-free under ${under}`, 'Call a server please', 'Request the bill, split three ways'],
+    hi: ['मसालेदार शाकाहारी क्या है?', b && c && `दो ${name(b)} और एक ${name(c)}`, asked && `क्या ${name(asked)} में मेवे हैं?`, 'बिल ले आइए, तीन हिस्सों में'],
+    mr: ['तिखट शाकाहारी काय आहे?', b && c && `दोन ${name(b)} आणि एक ${name(c)}`, asked && `${name(asked)}मध्ये सुकामेवा आहे का?`, 'बिल आणा, तीन भागांत'],
+  };
+  return (phrases[lang] || []).filter(Boolean);
+}
 
 // What one guest chose for this session: language, larger text, a slower voice, more time to speak.
 // Everything goes back to the defaults when the session ends, ready for the next guests.
@@ -361,7 +370,7 @@ function Tablet({ table, state, voice, setVoiceState, toast, now, t }) {
   return (
     <main className="gutter pb-28" onPointerDownCapture={bump} onKeyDownCapture={bump} onWheel={bump} onTouchStart={bump}>
       {!session ? (
-        <Standby table={table} onStart={startSession} t={t} />
+        <Standby table={table} menu={menu} onStart={startSession} t={t} />
       ) : (
         <div className="max-w-[1400px] mx-auto">
           <section className="mt-3 flex flex-wrap items-end justify-between gap-4">
@@ -377,7 +386,7 @@ function Tablet({ table, state, voice, setVoiceState, toast, now, t }) {
               <Preferences filters={filters} setFilters={setFilters} />
               <CategoryRail filters={filters} setFilters={setFilters} menu={menu} />
               <div className="flex items-baseline justify-between mt-6 mb-3 gap-3">
-                <h2 className="on-photo font-serif text-2xl text-ink first-letter:uppercase">{lang === 'en' ? describeFilters(filters) : L.cats[filters.category]}</h2>
+                <h2 className="on-photo font-serif text-2xl text-ink first-letter:uppercase">{lang === 'en' ? describeFilters(filters) : (L.cats[filters.category] || catLabel(filters.category))}</h2>
                 <span className="on-photo text-sm text-ink/80 tabular-nums shrink-0">{t.dishes(shown.length)}</span>
               </div>
               {shown.length ? (
@@ -395,7 +404,7 @@ function Tablet({ table, state, voice, setVoiceState, toast, now, t }) {
               )}
             </div>
             <aside className="order-1 lg:order-2 lg:sticky lg:top-[96px] min-w-0">
-              <VoiceAssistant ref={voiceRef} table={table} usage={state.usage} voice={voice} onResult={onAssistant} onCaption={setCaption}
+              <VoiceAssistant ref={voiceRef} table={table} menu={menu} usage={state.usage} voice={voice} onResult={onAssistant} onCaption={setCaption}
                 setVoiceState={setVoiceState} bump={bump} toast={toast} autoListen={autoListen} />
             </aside>
           </div>
@@ -460,11 +469,12 @@ function SessionRing({ remaining }) {
   );
 }
 
-function Standby({ table, onStart, t }) {
+function Standby({ table, menu, onStart, t }) {
   const { restaurant } = useContext(RestaurantContext);
   const { prefs } = usePrefs();
-  const examples = { en: [['"Something spicy and vegetarian"', 'Filters the menu to match'], ['"Risotto, extra cheese, no garlic"', 'Adds it with your changes'], ['"Split the bill four ways"', 'Lets your server know']] }[prefs.lang]
-    || (EXAMPLES[prefs.lang] || []).slice(0, 3).map((q) => [`"${q}"`, '']);
+  const dish = menu.find((m) => m.available);
+  const examples = { en: [['"Something spicy and vegetarian"', 'Filters the menu to match'], ...(dish ? [[`"${dish.name}, please"`, 'Adds it to your order']] : []), ['"Split the bill four ways"', 'Lets your server know']] }[prefs.lang]
+    || samplePhrases(menu, prefs.lang).slice(0, 3).map((q) => [`"${q}"`, '']);
   return (
     <section className="max-w-[1400px] mx-auto mt-3 cursor-pointer" onClick={() => onStart(false)}>
       <div className="glass relative overflow-hidden rounded-[28px] px-6 py-14 sm:py-20 text-center">
@@ -556,19 +566,21 @@ function Preferences({ filters, setFilters }) {
   );
 }
 
+// Built-in categories have their own icons; an imported menu's sections share the plate icon.
+const CATEGORY_ICONS = CATEGORIES.map((c) => c.id);
 function CategoryRail({ filters, setFilters, menu }) {
   const L = labels(usePrefs().prefs.lang);
   return (
     <div className="glass rounded-2xl mt-5 px-2 pt-3 pb-2">
       <div className="overflow-x-auto no-scrollbar">
         <div className="flex gap-4 sm:gap-6 px-1 pb-1 min-w-max">
-          {CATEGORIES.map((c) => {
+          {menuCategories(menu).map((c) => {
             const on = filters.category === c.id;
             const count = c.id === 'all' ? menu.length : c.id === 'specials' ? menu.filter((m) => m.chefSpecial).length : menu.filter((m) => m.category === c.id).length;
             return (
               <button key={c.id} onClick={() => setFilters((f) => ({ ...f, category: c.id }))} aria-pressed={on} className="group flex flex-col items-center gap-2 w-[76px]">
                 <span className={'w-[66px] h-[66px] rounded-full flex items-center justify-center border transition ' + (on ? 'bg-ink border-ink text-gold shadow-lg' : 'glass-chip text-ink group-hover:border-gold')}>
-                  <Icon name={c.id} className="w-7 h-7" />
+                  <Icon name={CATEGORY_ICONS.includes(c.id) ? c.id : 'mains'} className="w-7 h-7" />
                 </span>
                 <span className={'text-[12.5px] text-center leading-tight ' + (on ? 'text-ink font-semibold' : 'text-muted')}>{L.cats[c.id] || c.label}</span>
                 <span className="text-[10.5px] text-muted/80 -mt-1.5 tabular-nums">{count}</span>
@@ -651,7 +663,9 @@ function Customizer({ item, onClose, onAdd, onAsk }) {
   return (
     <div className="fixed inset-0 z-[55] bg-ink/40 flex items-end sm:items-center justify-center sm:gutter" onClick={onClose}>
       <div className="glass-strong w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl overflow-hidden shadow-2xl" onClick={(e) => e.stopPropagation()} role="dialog" aria-label={`Customize ${item.name}`}>
-        <div className="h-40 relative"><DishImage item={item} /><button onClick={onClose} className="absolute top-3 right-3 w-9 h-9 rounded-full bg-white/90 flex items-center justify-center" aria-label="Close"><Icon name="x" className="w-4 h-4" /></button></div>
+        <div className="h-40 relative"><DishImage item={item} /><button onClick={onClose} className="absolute top-3 right-3 w-9 h-9 rounded-full bg-white/90 flex items-center justify-center" aria-label="Close"><Icon name="x" className="w-4 h-4" /></button>
+          {item.imgCredit && <span className="absolute bottom-1.5 right-2 text-[10px] text-white/90 bg-black/35 rounded px-1.5">Photo: Wikimedia Commons</span>}
+        </div>
         <div className="p-5" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)' }}>
           <h3 className="font-serif text-2xl">{dishName(item, prefs.lang)}</h3>
           <p className="text-sm text-muted mt-1">{item.desc}</p>
@@ -757,7 +771,7 @@ function OrderSent({ sent, now, onUndo, onClose }) {
 }
 
 // ---------------- Voice assistant ----------------
-const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, usage, voice, onResult, onCaption, setVoiceState, bump, toast, autoListen }, ref) {
+const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, usage, voice, onResult, onCaption, setVoiceState, bump, toast, autoListen }, ref) {
   const { restaurant } = useContext(RestaurantContext);
   const { prefs } = usePrefs();
   const t = ui(prefs.lang);
@@ -1273,8 +1287,8 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, usage, 
         <p className="label mb-2">{t.trySaying}</p>
         <div className="flex flex-wrap gap-1.5">
           {prefs.lang === 'en'
-            ? SAMPLE_PHRASES.map((p) => <button key={p} onClick={() => simulate(p)} disabled={cooling || busy} className="phrase">{p}</button>)
-            : (EXAMPLES[prefs.lang] || []).map((p) => <span key={p} className="phrase cursor-default">{p}</span>)}
+            ? samplePhrases(menu, 'en').map((p) => <button key={p} onClick={() => simulate(p)} disabled={cooling || busy} className="phrase">{p}</button>)
+            : samplePhrases(menu, prefs.lang).map((p) => <span key={p} className="phrase cursor-default">{p}</span>)}
         </div>
       </div>
       <p className="px-4 pb-4 text-[11.5px] text-muted flex gap-1.5"><Icon name="info" className="w-3.5 h-3.5 shrink-0 mt-0.5" /><span>{heardBy} {spokenBy}</span></p>

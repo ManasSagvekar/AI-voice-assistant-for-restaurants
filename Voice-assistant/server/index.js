@@ -3,6 +3,7 @@
 // updates pushed to both over Server-Sent Events.
 import http from 'node:http';
 import { readFile, mkdir } from 'node:fs/promises';
+import { existsSync, mkdirSync } from 'node:fs';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +12,8 @@ import { createAssistant } from './assistant.js';
 import { createWhisper } from './whisper.js';
 import { createLicense } from './license.js';
 import { createBackups } from './backup.js';
-import { validateCall, CATEGORIES, ALLERGEN_KEYS, UNDO_MS } from '../shared/engine.js';
+import { validateCall, CATEGORIES, ALLERGEN_KEYS, UNDO_MS, CURRENCIES, setMenuMeta, fmt } from '../shared/engine.js';
+import { createPhotos } from './photos.js';
 import { isLang } from '../shared/i18n.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -23,7 +25,18 @@ const DB_FILE = process.env.DB_FILE || path.join(ROOT, 'data', 'flavoria.db');
 const SESSION_TTL = 12 * 3600e3;
 
 await mkdir(path.dirname(DB_FILE), { recursive: true });
-const store = createStore(DB_FILE);
+// DB_FILE holds this computer's link to its restaurant account (and, standalone, everything else).
+// Each linked restaurant keeps its menu, orders and tables in its own file under data/restaurants/,
+// so signing out of one restaurant and connecting another never mixes their data. `store` always
+// points at the restaurant in use.
+const deviceStore = createStore(DB_FILE);
+const RESTAURANT_DIR = path.join(path.dirname(DB_FILE), 'restaurants');
+// Dish photos found for imported menus, served at /media/.
+const MEDIA_DIR = path.join(path.dirname(DB_FILE), 'media');
+const photos = createPhotos(MEDIA_DIR);
+let current = deviceStore;
+let currentRestaurant = null;
+const store = new Proxy({}, { get: (_, key) => current[key] });
 const assistant = createAssistant(store);
 const whisper = createWhisper(ROOT);
 const transcribeStamps = new Map(); // table -> timestamps, caps GPU work per tablet
@@ -45,17 +58,51 @@ function slowLane(table, { ticket = false } = {}) {
 }
 const tableList = (count) => Array.from({ length: count }, (_, i) => 'T' + (i + 1));
 const envTableCount = Number(process.env.TABLE_COUNT);
-const savedTableCount = Number(store.setting('table_count'));
-let TABLE_COUNT = Number.isInteger(savedTableCount) && savedTableCount >= 1 && savedTableCount <= 99
-  ? savedTableCount
-  : Number.isInteger(envTableCount) && envTableCount >= 1 && envTableCount <= 99 ? envTableCount : 8;
-let TABLES = tableList(TABLE_COUNT);
-store.setting('table_count', String(TABLE_COUNT));
+let TABLE_COUNT, TABLES;
+// The restaurant's table count, currency and menu sections, read again whenever the restaurant changes.
+function loadRestaurantSettings() {
+  setMenuMeta(store.menuMeta());
+  const saved = Number(store.setting('table_count'));
+  TABLE_COUNT = Number.isInteger(saved) && saved >= 1 && saved <= 99
+    ? saved
+    : Number.isInteger(envTableCount) && envTableCount >= 1 && envTableCount <= 99 ? envTableCount : 8;
+  TABLES = tableList(TABLE_COUNT);
+  store.setting('table_count', String(TABLE_COUNT));
+}
+loadRestaurantSettings();
+
+// Opens the data of the restaurant this computer is signed in to (none: the device database).
+function useRestaurantData(id) {
+  if (id === currentRestaurant) return;
+  const previous = current;
+  if (id) {
+    if (!/^[\w-]{1,64}$/.test(id)) throw new Error('Unexpected restaurant id.');
+    mkdirSync(RESTAURANT_DIR, { recursive: true });
+    const file = path.join(RESTAURANT_DIR, `${id}.db`);
+    // The first restaurant linked before data was kept per restaurant takes the existing data with it.
+    if (!existsSync(file) && !deviceStore.setting('restaurant_data_moved')) {
+      deviceStore.backupTo(file);
+      deviceStore.setting('restaurant_data_moved', id);
+    }
+    current = createStore(file);
+    current.setting('license_refresh_token', ''); // the link lives in the device database only
+    current.setting('license_access', '');
+  } else current = deviceStore;
+  currentRestaurant = id;
+  if (previous !== deviceStore) previous.db.close();
+  loadRestaurantSettings();
+  assistant.reset();
+  for (const map of [transcribeStamps, speakStamps, slowStamps, slowTickets]) map.clear();
+  for (const c of clients) c.res.end();
+  clients.clear();
+  if (id) console.log(`[license] Restaurant data: ${path.join(RESTAURANT_DIR, `${id}.db`)}`);
+}
 
 // ---------- restaurant licence (admin app) ----------
 // Suspending, flagging or an unpaid plan closes every staff session and live screen at once.
-const license = createLicense(store, {
+const license = createLicense(deviceStore, {
   url: process.env.SUPABASE_URL, anonKey: process.env.SUPABASE_ANON_KEY, name: process.env.RESTAURANT_NAME || 'Restaurant',
+  onRestaurant: (id) => useRestaurantData(id),
   onBlock: (s) => {
     store.dropAllSessions();
     for (const c of clients) c.res.end();
@@ -85,9 +132,12 @@ const allowAttempt = (req) => {
 };
 
 // ---------- backups ----------
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(DB_FILE), 'backups');
+const BACKUP_COPY_DIR = process.env.BACKUP_COPY_DIR || '';
+const perRestaurant = (dir) => () => (dir && currentRestaurant ? path.join(dir, currentRestaurant) : dir);
 const backups = createBackups(store, {
-  dir: process.env.BACKUP_DIR || path.join(path.dirname(DB_FILE), 'backups'),
-  copyDir: process.env.BACKUP_COPY_DIR || '', keep: Number(process.env.BACKUP_KEEP) || 14,
+  dir: perRestaurant(BACKUP_DIR),
+  copyDir: perRestaurant(BACKUP_COPY_DIR), keep: Number(process.env.BACKUP_KEEP) || 14,
   hour: /^\d{1,2}$/.test(process.env.BACKUP_HOUR || '') ? Number(process.env.BACKUP_HOUR) : 3,
 });
 
@@ -102,9 +152,9 @@ const tabletSettings = () => ({
 
 // ---------- live updates (SSE) ----------
 const clients = new Set();
-const tableSnapshot = (t) => ({ table: t, menu: store.menu(), cart: store.cart(t), note: store.note(t), orders: store.tableOrders(t), requests: store.requests(t), usage: assistant.usage(t), now: Date.now() });
+const tableSnapshot = (t) => ({ table: t, menu: store.menu(), meta: store.menuMeta(), cart: store.cart(t), note: store.note(t), orders: store.tableOrders(t), requests: store.requests(t), usage: assistant.usage(t), now: Date.now() });
 const adminSnapshot = () => ({
-  tables: TABLES, menu: store.menu(), orders: store.recentOrders(), requests: store.requests(), security: store.security(),
+  tables: TABLES, menu: store.menu(), meta: store.menuMeta(), photosPending, orders: store.recentOrders(), requests: store.requests(), security: store.security(),
   occupancy: store.tableStatuses(TABLES), settings: tabletSettings(),
   backup: backups.status(), allergenLog: store.allergenLog(), undoMs: UNDO_MS,
   carts: Object.fromEntries(TABLES.map((t) => [t, store.cart(t).reduce((s, l) => s + l.qty, 0)])), now: Date.now(),
@@ -173,7 +223,7 @@ const isStaff = (req) => { const t = cookies(req).flv_staff; return !!t && store
 const secureCookie = (req) => (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : '');
 const sameOrigin = (req) => { try { return !req.headers.origin || new URL(req.headers.origin).host === req.headers.host; } catch { return false; } };
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.avif': 'image/avif',
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.avif': 'image/avif', '.jpg': 'image/jpeg', '.webp': 'image/webp',
   '.mjs': 'text/javascript; charset=utf-8', '.wasm': 'application/wasm', '.onnx': 'application/octet-stream' };
 // The customer and staff apps each keep their own HTML + client source; only the built
 // JS/CSS bundle output and the backend below are shared between them.
@@ -194,7 +244,7 @@ async function serveFile(res, base, rel, cache = 'no-cache') {
 const CAT_IDS = CATEGORIES.map((c) => c.id).filter((c) => c !== 'all' && c !== 'specials');
 const MEALS = ['breakfast', 'lunch', 'dinner'];
 const str = (v, max, field) => (typeof v === 'string' && v.trim().length > 0 && v.length <= max ? v.trim() : bad(`${field} must be 1-${max} characters.`));
-const money = (v) => (typeof v === 'number' && isFinite(v) && v >= 0.5 && v <= 500 ? Math.round(v * 100) / 100 : bad('Price must be between $0.50 and $500.'));
+const money = (v) => (typeof v === 'number' && isFinite(v) && v >= 0.5 && v <= 100000 ? Math.round(v * 100) / 100 : bad('Price must be between 0.50 and 100,000.'));
 function itemPatch(body, itemId) {
   const p = {};
   if ('price' in body) p.price = money(body.price);
@@ -216,10 +266,12 @@ function itemPatch(body, itemId) {
   if (!Object.keys(p).length) bad('Nothing to update.');
   return p;
 }
-function newItem(r) {
+function newItem(r, categories) {
   return {
     name: str(r.name, 80, 'Name'), desc: typeof r.desc === 'string' ? r.desc.slice(0, 200) : '', price: money(r.price),
-    category: CAT_IDS.includes(r.category) ? r.category : bad('Unknown category.'),
+    category: categories.has(r.category) ? r.category : bad('Unknown category.'),
+    // Other names guests may use for the dish ("chapati" for "Tandoori Roti / Chapati").
+    aliases: Array.isArray(r.aliases) ? r.aliases.filter((a) => typeof a === 'string' && a.length >= 2 && a.length <= 60).slice(0, 6) : [],
     diet: r.diet === 'nonveg' ? 'nonveg' : 'veg', vegan: r.vegan === true && r.diet !== 'nonveg', gf: r.gf === true,
     spicy: [0, 1, 2, 3].includes(r.spicy) ? r.spicy : 0,
     meals: Array.isArray(r.meals) && r.meals.length && r.meals.every((m) => MEALS.includes(m)) ? [...new Set(r.meals)] : bad('Pick at least one meal time.'),
@@ -227,7 +279,22 @@ function newItem(r) {
     allergens: Array.isArray(r.allergens) ? [...new Set(r.allergens.filter((a) => ALLERGEN_KEYS.includes(a)))] : [], allergensChecked: false,
   };
 }
-const fmtMoney = (n) => '$' + n.toFixed(2);
+
+// Photos for newly published dishes are found one at a time after publishing (see server/photos.js);
+// each appears on the tablets as it arrives. A photo only lands on the restaurant that asked for it.
+let photoQueue = Promise.resolve();
+let photosPending = 0;
+function addPhotos(dishes) {
+  const restaurant = currentRestaurant;
+  photosPending += dishes.length;
+  photoQueue = photoQueue.then(() => photos.findAll(dishes, (dish, photo) => {
+    photosPending--;
+    if (photo && currentRestaurant === restaurant && store.item(dish.id)) {
+      store.updateItem(dish.id, { img: photo.img, imgCredit: photo.credit, imgSource: photo.source });
+    }
+    broadcast();
+  })).catch((e) => console.error('[photos]', e.message));
+}
 
 // ---------- routes ----------
 async function route(req, res) {
@@ -253,6 +320,7 @@ async function route(req, res) {
   // The dashboard used to live at /admin; that name now belongs to the super-admin app.
   if (method === 'GET' && (p === '/admin' || p === '/admin/')) { res.writeHead(302, { Location: '/restaurant' }); return res.end(); }
   // Vendored runtimes (React, ONNX wasm, the VAD model) only change on upgrade, so tablets may keep them a day.
+  if (method === 'GET' && p.startsWith('/media/')) return serveFile(res, MEDIA_DIR, p.slice('/media/'.length), 'public, max-age=604800');
   if (method === 'GET' && p.startsWith('/assets/')) return serveFile(res, ASSETS, p.slice('/assets/'.length), p.startsWith('/assets/vendor/') ? 'public, max-age=86400' : 'public, max-age=300');
   if (method === 'GET' && p === '/api/config') {
     const s = license.status();
@@ -291,6 +359,29 @@ async function route(req, res) {
         ? 'The licence server refused this system. Check SUPABASE_URL and SUPABASE_ANON_KEY in its .env.'
         : "Can't reach the licence server. Check the internet connection and try again." });
     }
+  }
+
+  // Sign this computer out of its restaurant, so another restaurant can connect. Signed-in staff may do
+  // it from the dashboard; from the sign-in screen it takes this restaurant's username and password.
+  if (p === '/api/admin/disconnect' && method === 'POST') {
+    if (!license.licensed || !license.status().linked) return send(res, 409, { error: 'This system is not connected to a restaurant.' });
+    const body = await readJson(req);
+    if (!isStaff(req)) {
+      if (!allowAttempt(req)) return send(res, 429, { error: 'Too many attempts. Wait a minute and try again.' });
+      if (typeof body.username !== 'string' || typeof body.password !== 'string' || !body.username || !body.password) bad("Enter this restaurant's username and password.");
+      try {
+        if (!(await license.isOwner(body.username.slice(0, 64), body.password.slice(0, 200)))) {
+          return send(res, 401, { error: `That is not the username and password for ${license.status().name}.` });
+        }
+      } catch (e) {
+        if (e.userFacing) return send(res, e.status, { error: e.message });
+        console.error('[license]', e.message);
+        return send(res, 503, { error: "Can't reach the licence server. Check the internet connection and try again." });
+      }
+      loginAttempts.delete(req.socket.remoteAddress);
+    }
+    await license.signOut();
+    return send(res, 200, { ok: true }, { 'Set-Cookie': 'flv_staff=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
   }
 
   const service = license.status();
@@ -363,7 +454,7 @@ async function route(req, res) {
         const split = Number.isInteger(body.split) && body.split >= 1 && body.split <= 12 ? body.split : bad('Split must be 1-12.');
         const total = store.tableOrders(table).reduce((s, o) => s + o.total, 0);
         if (!total) return send(res, 409, { error: 'Send your order to the kitchen first, then request the bill.' });
-        store.addRequest(table, 'bill', `Bill ${fmtMoney(total)}${split > 1 ? ` · split ${split} ways (${fmtMoney(total / split)} each)` : ''}`, split);
+        store.addRequest(table, 'bill', `Bill ${fmt(total)}${split > 1 ? ` · split ${split} ways (${fmt(total / split)} each)` : ''}`, split);
       } else bad('Unknown request type.');
     } else if (method === 'POST' && sub === '/speak') {
       // Alice's Piper voice, synthesized locally by the voice service; the tablet plays the WAV.
@@ -428,10 +519,37 @@ async function route(req, res) {
     if (method === 'PATCH' && (r = sub.match(/^\/menu\/([\w-]+)$/))) {
       if (!store.updateItem(r[1], itemPatch(body, r[1]))) return send(res, 404, { error: 'Dish not found.' });
     } else if (method === 'POST' && sub === '/menu') {
-      if (!Array.isArray(body.items) || !body.items.length || body.items.length > 60) bad('Send 1-60 dishes.');
-      const added = store.publishItems(body.items.map(newItem));
+      if (!Array.isArray(body.items) || !body.items.length || body.items.length > 200) bad('Send 1-200 dishes.');
+      // An imported menu brings its own sections and currency, and may replace the whole menu.
+      const sections = body.sections === undefined ? [] : Array.isArray(body.sections) && body.sections.length <= 40
+        ? body.sections.map((sec) => ({ id: sec && /^sec-[a-z0-9-]{1,40}$/.test(sec.id) ? sec.id : bad('Unknown menu section.'), label: str(sec.label, 48, 'Section name') }))
+        : bad('A menu can have up to 40 sections.');
+      if (body.currency !== undefined && !CURRENCIES[body.currency]) bad('Unknown currency.');
+      if (body.photos !== undefined && !['web', 'none'].includes(body.photos)) bad('Choose whether to add dish photos.');
+      const replace = body.replace === true;
+      const kept = replace ? [] : store.menuMeta().sections.filter((sec) => !sections.some((n) => n.id === sec.id));
+      const allSections = [...kept, ...sections];
+      const items = body.items.map((it) => newItem(it, new Set([...CAT_IDS, ...allSections.map((sec) => sec.id)])));
+      const added = replace ? store.replaceMenu(items) : store.publishItems(items);
+      store.setMenuMeta({ currency: body.currency, sections: allSections });
+      setMenuMeta(store.menuMeta());
+      if (replace) for (const t of TABLES) assistant.forget(t);
+      if (body.photos === 'web' && added.length) addPhotos(added);
       broadcast();
       return send(res, 201, { added: added.length });
+    } else if (method === 'POST' && (r = sub.match(/^\/menu\/([\w-]+)\/photo$/))) {
+      const dish = store.item(r[1]);
+      if (!dish) return send(res, 404, { error: 'Dish not found.' });
+      if (body.action === 'remove') store.updateItem(dish.id, { img: null, imgCredit: null, imgSource: null });
+      else if (body.action === 'find') {
+        let photo;
+        try { photo = await photos.find(dish.name, { skip: dish.imgSource ? [dish.imgSource] : [] }); } catch (e) {
+          console.error('[photos]', e.message);
+          return send(res, 503, { error: "Couldn't reach Wikipedia. Check the internet connection and try again." });
+        }
+        if (!photo) return send(res, 404, { error: `No ${dish.img ? 'other ' : ''}photo of this dish was found on Wikipedia.` });
+        store.updateItem(dish.id, { img: photo.img, imgCredit: photo.credit, imgSource: photo.source });
+      } else bad('Unknown photo action.');
     } else if (method === 'PATCH' && (r = sub.match(/^\/tables\/(T\d{1,2})\/occupancy$/))) {
       if (!TABLES.includes(r[1])) return send(res, 404, { error: 'Unknown table.' });
       if (typeof body.occupied !== 'boolean') bad('occupied must be a boolean.');
@@ -469,13 +587,13 @@ export const server = http.createServer(async (req, res) => {
   }
 });
 server.listen(PORT, () => {
+  license.start(); // opens the signed-in restaurant's data first, so the lines below describe it
   console.log('Flavoria is running');
   console.log(`  Customer tablets:  ${PUBLIC_URL}/table/1 ... /table/${TABLE_COUNT}`);
   console.log(`  Restaurant staff:  ${PUBLIC_URL}/restaurant`);
   console.log(`  Database:          ${DB_FILE}`);
   console.log(`  Licence:           ${license.licensed ? license.status().state : 'standalone (no SUPABASE_URL)'}`);
   console.log(`  Backups:           ${backups.status().dir}${process.env.BACKUP_COPY_DIR ? ' + ' + process.env.BACKUP_COPY_DIR : ''}`);
-  license.start();
   backups.start();
   whisper.start();
 });

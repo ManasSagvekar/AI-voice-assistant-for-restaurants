@@ -26,5 +26,6 @@ export function createSupabase(url, anonKey) {
     signIn: (email, password) => request('/auth/v1/token?grant_type=password', { email, password }),
     refresh: (refreshToken) => request('/auth/v1/token?grant_type=refresh_token', { refresh_token: refreshToken }),
     rpc: (fn, args, token) => request('/rest/v1/rpc/' + fn, args, token),
+    signOut: (token) => request('/auth/v1/logout', {}, token),
   };
 }

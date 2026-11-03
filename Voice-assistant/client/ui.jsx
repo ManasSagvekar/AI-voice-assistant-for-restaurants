@@ -1,4 +1,4 @@
-import { MODIFIERS } from '../shared/engine.js';
+import { MODIFIERS, setMenuMeta } from '../shared/engine.js';
 
 export const { useState, useEffect, useRef, useMemo, useCallback, useContext, createContext } = React;
 
@@ -172,7 +172,7 @@ const PAUSED = {
   suspended: ['Service suspended', 'Access has been suspended by your service provider. Contact them for details.'],
   offline: ['Can’t verify the subscription', 'This computer can’t reach the licence server. Check its internet connection; service resumes automatically.'],
 };
-export function ServicePaused({ state, staff }) {
+export function ServicePaused({ state, staff, children }) {
   const { restaurant } = useContext(RestaurantContext);
   const [title, text] = staff ? PAUSED[state] || PAUSED.suspended : ['The assistant is resting', 'Table ordering is unavailable right now. A member of staff will be happy to take your order.'];
   return (
@@ -181,6 +181,7 @@ export function ServicePaused({ state, staff }) {
         <p className="font-serif text-2xl">{restaurant}</p>
         <h1 className="font-serif text-3xl mt-6">{title}</h1>
         <p className="text-sm text-muted mt-2">{text}</p>
+        {children}
       </div>
     </main>
   );
@@ -198,6 +199,7 @@ export function useLive(url) {
     es.addEventListener('snapshot', (e) => {
       const d = JSON.parse(e.data);
       skew.current = d.now - Date.now();
+      if (d.meta) setMenuMeta(d.meta); // currency and menu sections, before anything renders a price
       setSnap(d); setOnline(true);
     });
     es.onerror = () => { setOnline(false); serviceChanged(); };

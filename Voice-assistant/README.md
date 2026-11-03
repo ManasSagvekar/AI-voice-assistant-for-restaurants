@@ -51,8 +51,9 @@ With `SUPABASE_URL` and `SUPABASE_ANON_KEY` set, this server is licensed by the 
 2. **Staff PIN.** Staff then sign in with the 6-digit PIN set in the admin app, checked by Supabase (`verify_staff_pin`). A PIN only works on its own restaurant's server.
 3. **Access checks.** The status is re-checked every 10 seconds and on every voice request (`increment_usage`, which also counts it against the restaurant's rate limit). When the admin marks the restaurant unpaid or suspends it, or it is flagged for abuse or its plan expires, the server closes every staff session and live screen, refuses table and staff requests with `403 service_suspended`, and both apps show a paused screen.
    **Voice limit.** Reaching the plan's voice limit does not close the restaurant. Each table then gets one voice turn every 20 seconds until the hour or day resets, and the tablet uses its own voice instead of Piper; ordering by touch and the staff dashboard are never limited. Staff see a notice from 80%. Only three times the limit in one window counts as abuse and revokes access (this needs the `20261102000000_soft_limits_and_billing.sql` migration).
-4. **Branding.** Both apps show the restaurant's name from the admin app in place of any product logo.
-5. **Privacy.** Only request counts are sent to Supabase. Orders, bills and totals never leave this server.
+4. **Signing out of a restaurant.** To use this computer for another restaurant, choose **Switch restaurant** in the dashboard header, or, without the staff PIN, **Not <name>? Sign out of this restaurant** under the sign-in form (it asks for that restaurant's username and password; it is also on the paused screen). The server ends its Supabase session and shows **Connect** again. Each restaurant keeps its menu, orders, tables and settings in its own file, `data/restaurants/<restaurant id>.db`, with backups in `data/backups/<restaurant id>/`, so connecting it again brings everything back. The first restaurant connected before this change takes over the data that was in `data/flavoria.db`, which now holds only this computer's link.
+5. **Branding.** Both apps show the restaurant's name from the admin app in place of any product logo.
+6. **Privacy.** Only request counts are sent to Supabase. Orders, bills and totals never leave this server.
 
 If Supabase can't be reached, the server keeps serving on the last known status until the plan's end date, so an internet outage never stops dinner service; staff see an "offline" notice. A suspension made in the admin app while the restaurant is offline takes effect when it reconnects. `server/license.js` holds this logic and `server/supabase.js` the minimal REST client.
 
@@ -61,6 +62,8 @@ Staff can change the active table count from the dashboard's **Tables** tab (1�
 ## Tablets, ordering and service
 
 **Sending an order.** Nothing reaches the kitchen until the guest confirms a read-back: tapping **Send to kitchen** shows the order and total first, and saying "send my order" makes the assistant read it back and wait for a yes. If the owner has chosen a dish to suggest with something in the order (Menu Control, **Details**, "Suggest with this dish"), it is offered once per order. For one minute after sending, and only until the kitchen starts it, the guest can take the order back (**Undo** on the tablet, or "cancel my order"); the dishes return to the cart.
+
+**Importing a menu.** In the dashboard's **Import Menu** tab, drop the restaurant's PDF menu (or a .txt/.csv price list). It is read on the staff computer with PDF.js (`shared/menuparse.js`): each section heading becomes one of the tablet's categories, in the menu's order, and each dish keeps its price and the menu's currency (AED, ₹, $, € and others; the currency then applies to every price in the app). Price ranges such as "AED 31–38" are flagged to check, and diet, spice and allergen tags are only suggestions. Before publishing, staff choose whether the import replaces the current menu (the default while it is still the sample menu) or adds to it, and whether to add dish photos. With photos on, `server/photos.js` finds a free-licensed photo for each dish on Wikipedia, saves it in `data/media/` and serves it from `/media/`, so tablets never load images from the internet; Menu Control, **Details**, can find another photo or remove one, and links each photo's author and licence. Scanned menus and photos of menus have no text to read and are refused with an explanation.
 
 **Allergies.** Each dish has an allergen list and a "the kitchen has checked this list" tick (Menu Control, **Details**). The assistant answers allergy questions ("does the korma have nuts?") only for ticked dishes; otherwise it calls a server and says so. "Nut-free" style filters show only ticked dishes. Every allergy question and its answer is listed under Service Requests. Dishes can also be tagged Jain and Halal.
 
@@ -120,6 +123,7 @@ Two separate front-end apps share one backend:
 - `staff-app/`: the restaurant dashboard — `client/admin.jsx` and its own `public/admin.html`
 - `client/ui.jsx`, `client/tailwind.css`: components and styles shared by both front ends
 - `shared/engine.js`: menu/pricing/guardrail logic used by both the server and the browser
+- `shared/menuparse.js`: reads an uploaded menu's text into sections and dishes (staff browser, tested in Node)
 - `server/`: the one HTTP server, SQLite store and assistant pipeline both apps talk to
 - `public/assets/`: the built JS/CSS output for both apps (generated by `npm run build`, not hand-edited)
 

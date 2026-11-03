@@ -16,6 +16,8 @@ for (const f of ['react/umd/react.production.min.js', 'react-dom/umd/react-dom.p
 // Silero VAD for the table tablets: the ONNX web runtime, the VAD library, its audio worklet and model.
 mkdirSync('public/assets/vendor/ort', { recursive: true });
 mkdirSync('public/assets/vendor/vad', { recursive: true });
+// PDF.js reads uploaded menus in the staff browser; the dashboard loads it only when a PDF is dropped.
+mkdirSync('public/assets/vendor/pdfjs', { recursive: true });
 const vendor = {
   'onnxruntime-web/dist/ort.wasm.min.js': 'ort.wasm.min.js',
   'onnxruntime-web/dist/ort-wasm-simd-threaded.mjs': 'ort/ort-wasm-simd-threaded.mjs',
@@ -23,6 +25,8 @@ const vendor = {
   '@ricky0123/vad-web/dist/bundle.min.js': 'vad.bundle.min.js',
   '@ricky0123/vad-web/dist/vad.worklet.bundle.min.js': 'vad/vad.worklet.bundle.min.js',
   '@ricky0123/vad-web/dist/silero_vad_v5.onnx': 'vad/silero_vad_v5.onnx',
+  'pdfjs-dist/legacy/build/pdf.min.mjs': 'pdfjs/pdf.min.mjs',
+  'pdfjs-dist/legacy/build/pdf.worker.min.mjs': 'pdfjs/pdf.worker.min.mjs',
 };
 for (const [from, to] of Object.entries(vendor)) copyFileSync('node_modules/' + from, 'public/assets/vendor/' + to);
 console.log('Built public/assets');

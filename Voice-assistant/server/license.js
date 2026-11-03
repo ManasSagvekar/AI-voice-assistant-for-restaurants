@@ -11,13 +11,16 @@
 // down (see `usage`) instead of closing the restaurant; only a manual suspension, an unpaid or
 // expired plan, or an abuse flag closes it.
 //
+// Staff can sign this computer out of its restaurant (signOut), after which another restaurant can
+// connect. onRestaurant(id) is told which restaurant's data to use (null when signed out).
+//
 // Without SUPABASE_URL and SUPABASE_ANON_KEY it runs standalone, always active, with the local STAFF_PIN.
 import { createSupabase, SupabaseError } from './supabase.js';
 
 const POLL_MS = 10000;
 const OFFLINE_AFTER_MS = 45000; // no answer for this long counts as offline (shown to staff only)
 
-export function createLicense(store, { url, anonKey, name = 'Restaurant', onBlock = () => {} }) {
+export function createLicense(store, { url, anonKey, name = 'Restaurant', onBlock = () => {}, onRestaurant = () => {} }) {
   if (!url || !anonKey) {
     const standalone = { state: 'standalone', active: true, linked: true, name, offline: false, usage: 'ok' };
     return { licensed: false, status: () => standalone, start() {}, useVoice: async () => ({ ok: true, status: standalone }) };
@@ -68,6 +71,7 @@ export function createLicense(store, { url, anonKey, name = 'Restaurant', onBloc
     access = a ? { ...a, checkedAt: Date.now() } : null;
     store.setting('license_access', JSON.stringify(access));
     notify();
+    onRestaurant(access ? access.restaurant_id || null : null);
   }
   function unlink(why) {
     console.log(`[license] Device unlinked: ${why}.`);
@@ -108,6 +112,24 @@ export function createLicense(store, { url, anonKey, name = 'Restaurant', onBloc
     return status();
   }
 
+  // Whether these are the username and password of the restaurant this computer is signed in to.
+  async function isOwner(username, password) {
+    const email = await sb.rpc('login_email', { p_username: username });
+    if (!email) return false;
+    let s;
+    try { s = await sb.signIn(email, password); } catch (e) { if (e.status === 400) return false; throw e; }
+    const a = await sb.rpc('restaurant_access', {}, s.access_token);
+    sb.signOut(s.access_token).catch(() => {}); // this check needs no session of its own
+    return !!a && !!access && a.restaurant_id === access.restaurant_id;
+  }
+
+  // Ends this computer's restaurant session, here and (when reachable) in Supabase.
+  async function signOut() {
+    const s = session;
+    unlink('signed out from the staff dashboard');
+    if (s) await sb.signOut(s.token).catch(() => {});
+  }
+
   async function verifyPin(pin) {
     if (typeof pin !== 'string' || !/^\d{6}$/.test(pin)) return false;
     const ok = (await sb.rpc('verify_staff_pin', { p_pin: pin }, await token())) === true;
@@ -131,10 +153,11 @@ export function createLicense(store, { url, anonKey, name = 'Restaurant', onBloc
   }
 
   function start() {
+    if (linked() && access && access.restaurant_id) onRestaurant(access.restaurant_id);
     wasActive = status().active;
     if (linked()) check();
     setInterval(() => linked() && check(), POLL_MS);
   }
 
-  return { licensed: true, status, start, link, verifyPin, useVoice };
+  return { licensed: true, status, start, link, isOwner, signOut, verifyPin, useVoice };
 }
