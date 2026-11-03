@@ -2,7 +2,7 @@
 // Every write goes through here; callers broadcast the change afterwards.
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
-import { SEED_MENU, CATEGORIES, totals, priceLine } from '../shared/engine.js';
+import { SEED_MENU, totals, priceLine } from '../shared/engine.js';
 
 const now = () => Date.now();
 const id = (p) => p + randomBytes(4).toString('hex').toUpperCase();
@@ -264,6 +264,6 @@ export function createStore(file) {
     db, menu, item, updateItem, publishItems, replaceMenu, menuMeta, setMenuMeta, cart, note, addToCart, changeQty, removeLine, removeItem, setNote, resetTable,
     tableOrders, recentOrders, placeOrder, cancelOrder, latestOrder, advanceOrder, requests, addRequest, setRequestStatus, tableStatuses, setTableOccupied,
     logSecurity, security, setting, addSession, hasSession, dropSession, dropAllSessions,
-    logAllergen, allergenLog, backupTo, categories: CATEGORIES,
+    logAllergen, allergenLog, backupTo,
   };
 }

@@ -25,7 +25,6 @@ export function createAssistant(store) {
     stamps.set(table, list);
     return { used: list.length, limit: RATE_LIMIT, resetsAt: list.length ? list[0] + RATE_WINDOW : null };
   }
-  const resetUsage = (table) => stamps.delete(table);
   // Called whenever an order is sent or the table is reset, by any route.
   const forget = (table) => { pending.delete(table); offered.delete(table); };
   // Called when this computer switches restaurant.
@@ -228,5 +227,5 @@ export function createAssistant(store) {
     return { status: 200, body: { text: out.join(' '), heard: text, truncated, inspected: inspected[0] && inspected[0].tool === 'fallback' ? [] : inspected, effects, usage: usage(table) } };
   }
 
-  return { handle, usage, resetUsage, forget, reset };
+  return { handle, usage, forget, reset };
 }
