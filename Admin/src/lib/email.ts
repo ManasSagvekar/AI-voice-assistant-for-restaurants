@@ -5,7 +5,7 @@ import { planLabel, type Restaurant } from './types';
 
 type Kind = 'welcome' | 'password' | 'pin' | 'reminder';
 export type EmailOutcome = { sent: true } | { sent: false; reason: string };
-export type EmailExtras = { password?: string; daysLeft?: number; payUrl?: string };
+type EmailExtras = { password?: string; daysLeft?: number; payUrl?: string };
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const date = (iso: string | null) => (iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : null);

@@ -30,7 +30,7 @@ export const dishName = (item, lang) => (lang === 'hi' && item.nameHi) || (lang 
 // ---------- assistant replies ----------
 // Each entry takes named values. English filter replies are built in assistant.js from the filter
 // description; the other languages use the shorter `found` sentence.
-export const REPLIES = {
+const REPLIES = {
   en: {
     found: ({ n, first }) => `Here ${n === 1 ? 'is 1 dish' : `are ${n} dishes`}. I'd start with the ${first}.`,
     none: () => "I couldn't find anything like that tonight. Try removing a filter.",
@@ -152,7 +152,7 @@ export const REPLIES = {
 export const reply = (lang, key, vars = {}) => (REPLIES[lang] && REPLIES[lang][key] ? REPLIES[lang] : REPLIES.en)[key](vars);
 
 // ---------- table tablet labels ----------
-export const UI = {
+const UI = {
   en: {
     greeting: (r) => `Welcome to ${r}. What would you like to have?`,
     stillThereSay: (s) => `Are you still there? Session resetting in ${s} seconds.`,
@@ -271,7 +271,7 @@ export const UI = {
 export const ui = (lang) => UI[lang] || UI.en;
 
 // Filter chips, meal times and categories on the tablet.
-export const LABELS = {
+const LABELS = {
   en: {
     chips: { veg: 'Veg', nonveg: 'Non-Veg', vegan: 'Vegan', gf: 'Gluten-Free', spicy: 'Spicy', jain: 'Jain', halal: 'Halal', mild: 'Mild only', under: (p) => `Under ${p}`, without: (a) => `No ${a}` },
     meals: { breakfast: 'Breakfast', lunch: 'Lunch', dinner: 'Dinner' },

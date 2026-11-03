@@ -59,7 +59,7 @@ export const DietMark = ({ diet }) => (
   </span>
 );
 
-export const PLATE_TONES = { starters: '#C9925A', mains: '#8E5A3C', pizza: '#B4553A', desserts: '#7E5A72', beverages: '#C98A3E' };
+const PLATE_TONES = { starters: '#C9925A', mains: '#8E5A3C', pizza: '#B4553A', desserts: '#7E5A72', beverages: '#C98A3E' };
 export function DishImage({ item, className = '' }) {
   const [failed, setFailed] = useState(false);
   if (item.img && !failed) {
@@ -110,7 +110,7 @@ export const StatusPill = ({ status }) => {
 };
 
 // ---------- server access ----------
-export class ApiError extends Error { constructor(status, body) { super((body && body.error) || 'Request failed'); this.status = status; this.body = body; } }
+class ApiError extends Error { constructor(status, body) { super((body && body.error) || 'Request failed'); this.status = status; this.body = body; } }
 export async function api(path, method = 'GET', body) {
   const res = await fetch(path, {
     method, credentials: 'same-origin',
@@ -126,7 +126,7 @@ export async function api(path, method = 'GET', body) {
 }
 
 // Short alert tones. Browsers allow sound only after the page has been tapped or clicked once.
-export const TONES = { request: [[880, 0], [1175, 0.16]], order: [[660, 0], [880, 0.14], [1320, 0.28]], warn: [[880, 0], [660, 0.22]] };
+const TONES = { request: [[880, 0], [1175, 0.16]], order: [[660, 0], [880, 0.14], [1320, 0.28]], warn: [[880, 0], [660, 0.22]] };
 export function chime(kind = 'warn') {
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;

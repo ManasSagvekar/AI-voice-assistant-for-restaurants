@@ -1,6 +1,6 @@
 // Mirrors public.restaurants in supabase/migrations. No revenue or order data exists to model.
-export type RestaurantStatus = 'active' | 'suspended' | 'flagged';
-export type PaymentStatus = 'paid' | 'unpaid';
+type RestaurantStatus = 'active' | 'suspended' | 'flagged';
+type PaymentStatus = 'paid' | 'unpaid';
 export type Plan = 'monthly' | '3_month' | '6_month' | 'yearly';
 
 export interface Restaurant {

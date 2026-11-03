@@ -6,7 +6,7 @@ export const IDLE_LIMIT = 90;          // seconds of inactivity before a session
 export const WARN_AT = 30;             // seconds remaining when the "still there?" alert fires
 export const MAX_TURN_MS = 12000;      // max length of a single speech turn
 export const LONG_TURN_MS = 18000;     // ...when the guest picks "Take your time"
-export const MAX_TURN_CHARS = 240;     // ~18s of unhurried speech
+const MAX_TURN_CHARS = 240;     // ~18s of unhurried speech
 export const RATE_LIMIT = 6;           // voice commands...
 export const RATE_WINDOW = 60000;      // ...per minute per table session
 export const UNDO_MS = 60000;          // a guest can take an order back this long after sending it
@@ -31,7 +31,7 @@ export const ALLERGENS = {
 };
 export const ALLERGEN_KEYS = Object.keys(ALLERGENS);
 export const allergenLabel = (k) => (ALLERGENS[k] ? ALLERGENS[k].label : k);
-export const allergensIn = (t) => ALLERGEN_KEYS.filter((k) => ALLERGENS[k].re.test(t));
+const allergensIn = (t) => ALLERGEN_KEYS.filter((k) => ALLERGENS[k].re.test(t));
 
 // The restaurant's currency and its own menu sections (from an imported menu). The server sets them
 // for the restaurant in use; tablets and staff screens from each live snapshot.
@@ -57,7 +57,7 @@ export const CATEGORIES = [
 ];
 export const catLabel = (id) => (menuMeta.sections.find((c) => c.id === id) || CATEGORIES.find((c) => c.id === id) || {}).label || id;
 const BUILT_IN_CATS = CATEGORIES.map((c) => c.id).filter((c) => c !== 'all' && c !== 'specials');
-export const isCategory = (id) => BUILT_IN_CATS.includes(id) || menuMeta.sections.some((c) => c.id === id);
+const isCategory = (id) => BUILT_IN_CATS.includes(id) || menuMeta.sections.some((c) => c.id === id);
 // The tablet's category rail: All, chef specials when there are any, then each category the menu
 // uses, in menu order (an imported menu keeps its own sections and their order).
 export function menuCategories(menu) {
@@ -95,7 +95,7 @@ export const MODIFIERS = {
 };
 
 // Which modifiers each category accepts (the tool schema's allow-list).
-export const CATEGORY_MODS = {
+const CATEGORY_MODS = {
   starters: ['no_garlic', 'no_onion', 'dairy_free', 'extra_spicy', 'mild', 'sauce_side', 'add_avocado'],
   mains: ['extra_cheese', 'truffle', 'add_avocado', 'add_chicken', 'add_prawns', 'gf_base', 'no_garlic', 'no_onion', 'dairy_free', 'extra_spicy', 'mild', 'sauce_side'],
   pizza: ['extra_cheese', 'truffle', 'gf_base', 'no_garlic', 'no_onion', 'extra_spicy', 'mild'],
@@ -291,7 +291,7 @@ export function confirmWord(raw) {
   return null;
 }
 
-export function extractFilters(t) {
+function extractFilters(t) {
   const f = { ...EMPTY_FILTERS };
   let found = false;
   if (/\bnon[- ]?veg(etarian)?\b|\bmeat\b|\b(chicken|beef|lamb|seafood|fish|pork)\b/.test(t)) { f.diet = 'nonveg'; found = true; }
@@ -391,7 +391,7 @@ const T = {
   oneOf: (list) => (v) => (list.includes(v) ? null : `must be one of ${list.map(String).join(', ')}`),
   listOf: (list, max) => (v) => (Array.isArray(v) && v.length <= max && v.every((x) => list.includes(x)) ? null : `must be a list of up to ${max} of ${list.join(', ')}`),
 };
-export const TOOL_SCHEMAS = {
+const TOOL_SCHEMAS = {
   apply_filters: {
     diet: T.oneOf([null, 'veg', 'nonveg']), vegan: T.bool, gf: T.bool, jain: T.bool, halal: T.bool, avoid: T.listOf(ALLERGEN_KEYS, 6),
     spice: T.oneOf([null, 'spicy', 'mild']), meal: T.oneOf([null, ...MEALS]),
