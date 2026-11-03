@@ -40,7 +40,6 @@
   .phrase { text-align: left; font-size: 12px; border: 1px solid var(--line); background: var(--cream); border-radius: 10px; padding: .35rem .6rem; color: var(--ink); transition: all .22s cubic-bezier(.2,.8,.2,1); }
   .phrase:hover:not(:disabled) { border-color: var(--gold); background: #F7EEDF; transform: translateY(-1px); box-shadow: 0 8px 18px -14px rgba(81,52,18,.55); }
   .phrase:disabled { opacity: .45; cursor: not-allowed; }
-  .phrase-attack { border-style: dashed; border-color: #E6B4A8; color: #8A2E1C; background: #FDF6F4; }
   .no-scrollbar { scrollbar-width: none; } .no-scrollbar::-webkit-scrollbar { display: none; }
 
   /* Plate fallback, used whenever a dish photo can't load */
