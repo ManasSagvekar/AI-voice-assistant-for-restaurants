@@ -10,7 +10,6 @@ export const MAX_TURN_CHARS = 240;     // ~18s of unhurried speech
 export const RATE_LIMIT = 6;           // voice commands...
 export const RATE_WINDOW = 60000;      // ...per minute per table session
 export const UNDO_MS = 60000;          // a guest can take an order back this long after sending it
-export const TABLES = ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'];
 
 // Allergens staff can mark on a dish. The assistant answers allergy questions only for dishes whose
 // list the kitchen has confirmed (item.allergensChecked); otherwise it fetches a member of staff.
@@ -213,11 +212,6 @@ export function guardrail(text) {
   for (const r of GUARD_RULES) if (r.re.test(text)) return { blocked: true, kind: r.kind };
   return { blocked: false };
 }
-export const REFUSALS = {
-  'prompt-injection': "I'm sorry, I can't change how I work. I'm here to help with our menu, your order and table service.",
-  'price-manipulation': "I'm sorry, prices are set by the restaurant and can't be changed from the table. I'm happy to help you find something within your budget.",
-  'out-of-scope': "That's outside what I can help with here. I can recommend dishes, take your order, call a server or bring the bill.",
-};
 
 // ---------- Speech safety parsing ----------
 export function sanitizeTranscript(raw) {
@@ -473,20 +467,6 @@ export function inferTags(name, desc = '') {
     category, diet: nonveg ? 'nonveg' : 'veg', vegan: !nonveg && !dairy && !egg, gf: !gluten, spicy, allergens,
     meals: category === 'beverages' ? ['lunch', 'dinner'] : /\b(pancake|egg|toast|brunch)\b/.test(t) ? ['breakfast', 'lunch'] : ['lunch', 'dinner'],
   };
-}
-
-export function parseMenuText(text) {
-  const rows = [];
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    const m = line.match(/^(.{3,60}?)\s*(?:[-–—|:,.\t]+\s*)?\$?\s*(\d{1,3}(?:\.\d{1,2})?)\s*(?:[-–—|:,\t]+\s*(.*))?$/);
-    if (!m) continue;
-    const name = m[1].replace(/[.\s]+$/, '').trim();
-    const desc = (m[3] || '').trim();
-    rows.push({ name, desc, price: parseFloat(m[2]), conf: desc ? 0.94 : 0.81, ...inferTags(name, desc) });
-  }
-  return rows.slice(0, 40);
 }
 
 export const SAMPLE_EXTRACTION = [

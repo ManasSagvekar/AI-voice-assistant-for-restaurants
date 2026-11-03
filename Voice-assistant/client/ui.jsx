@@ -2,7 +2,6 @@ import { MODIFIERS, setMenuMeta } from '../shared/engine.js';
 
 export const { useState, useEffect, useRef, useMemo, useCallback, useContext, createContext } = React;
 
-export const uid = (p) => p + Math.random().toString(36).slice(2, 8).toUpperCase();
 export const tableName = (t) => 'Table ' + t.slice(1);
 export const mmss = (ms) => {
   const s = Math.max(0, Math.round(Math.abs(ms) / 1000));
@@ -10,7 +9,6 @@ export const mmss = (ms) => {
 };
 export const ago = (ms) => (ms < 60000 ? 'just now' : `${Math.floor(ms / 60000)} min ago`);
 export const modsText = (mods) => mods.map((k) => MODIFIERS[k].label.toLowerCase()).join(', ');
-export const joinWords = (arr) => (arr.length < 2 ? arr.join('') : arr.slice(0, -1).join(', ') + ' and ' + arr[arr.length - 1]);
 
 export const Icon = ({ name, className = 'w-5 h-5' }) => {
   const p = {
