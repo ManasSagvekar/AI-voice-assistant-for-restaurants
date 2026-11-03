@@ -12,7 +12,7 @@ import { createAssistant } from './assistant.js';
 import { createWhisper } from './whisper.js';
 import { createLicense } from './license.js';
 import { createBackups } from './backup.js';
-import { validateCall, CATEGORIES, ALLERGEN_KEYS, UNDO_MS, CURRENCIES, setMenuMeta, fmt } from '../shared/engine.js';
+import { validateCall, CATEGORIES, ALLERGEN_KEYS, UNDO_MS, RATE_LIMIT, CURRENCIES, setMenuMeta, fmt } from '../shared/engine.js';
 import { createPhotos } from './photos.js';
 import { isLang } from '../shared/i18n.js';
 
@@ -122,14 +122,34 @@ if (!license.licensed && !process.env.STAFF_PIN) {
   console.log(`\n  Using default staff PIN: ${staffPin}  (set STAFF_PIN to choose your own)\n`);
 }
 const pinOk = (pin) => timingSafeEqual(Buffer.from(sha(pin), 'hex'), Buffer.from(pinHash, 'hex'));
-const loginAttempts = new Map(); // ip -> timestamps
-const allowAttempt = (req) => {
-  const ip = req.socket.remoteAddress;
-  const recent = (loginAttempts.get(ip) || []).filter((t) => Date.now() - t < 60000);
-  if (recent.length >= 5) return false;
-  recent.push(Date.now()); loginAttempts.set(ip, recent);
-  return true;
+// The client's address. Behind the root `npm run dev` proxy every request arrives from 127.0.0.1, so
+// X-Forwarded-For is believed only from a loopback peer (anyone else could forge it).
+const LOOPBACK = /^(127\.|::1$|::ffff:127\.)/;
+const clientIp = (req) => {
+  const peer = req.socket.remoteAddress || '';
+  const forwarded = LOOPBACK.test(peer) && req.headers['x-forwarded-for'];
+  return forwarded ? String(forwarded).split(',').pop().trim() : peer;
 };
+// At most `max` events per address per minute. Old addresses are dropped so the map can't grow forever.
+function perAddress(max) {
+  const seen = new Map();
+  return {
+    allow(req) {
+      const ip = clientIp(req), now = Date.now();
+      if (seen.size > 5000) for (const [k, v] of seen) if (now - v[v.length - 1] > 60000) seen.delete(k);
+      const recent = (seen.get(ip) || []).filter((t) => now - t < 60000);
+      if (recent.length >= max) { seen.set(ip, recent); return Math.ceil((recent[0] + 60000 - now) / 1000); }
+      recent.push(now); seen.set(ip, recent);
+      return 0;
+    },
+    clear: (req) => seen.delete(clientIp(req)),
+  };
+}
+const loginAttempts = perAddress(5);
+const allowAttempt = (req) => !loginAttempts.allow(req);
+// Counted voice requests per device, so one device (or one person on the network) can't spend the
+// restaurant's voice allowance. A tablet in normal use stays far below this.
+const voiceBudget = perAddress(40);
 
 // ---------- backups ----------
 const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(DB_FILE), 'backups');
@@ -296,6 +316,18 @@ function addPhotos(dishes) {
   })).catch((e) => console.error('[photos]', e.message));
 }
 
+// Counts one voice request against the restaurant's allowance, or answers the request itself and
+// returns false: 429 when this device or the restaurant is over its voice budget (the tablet then
+// waits and uses touch), 403 when the restaurant has been blocked.
+async function countVoice(req, res, kind) {
+  const wait = voiceBudget.allow(req);
+  if (wait) { send(res, 429, { error: 'voice_busy', retryAfter: wait }, { 'Retry-After': String(wait) }); return false; }
+  const gate = await license.useVoice(kind);
+  if (gate.capped) { send(res, 429, { error: 'voice_busy', retryAfter: 60 }, { 'Retry-After': '60' }); return false; }
+  if (!gate.ok) { suspended(res, gate.status); return false; }
+  return true;
+}
+
 // ---------- routes ----------
 async function route(req, res) {
   const url = new URL(req.url, 'http://local');
@@ -350,7 +382,7 @@ async function route(req, res) {
     if (typeof body.username !== 'string' || typeof body.password !== 'string' || !body.username || !body.password) bad('Enter the restaurant username and password.');
     try {
       const s = await license.link(body.username.slice(0, 64), body.password.slice(0, 200));
-      loginAttempts.delete(req.socket.remoteAddress);
+      loginAttempts.clear(req);
       return send(res, 200, { service: { state: s.state, active: s.active, linked: s.linked }, restaurant: s.name });
     } catch (e) {
       if (e.userFacing) return send(res, e.status, { error: e.message });
@@ -378,7 +410,7 @@ async function route(req, res) {
         console.error('[license]', e.message);
         return send(res, 503, { error: "Can't reach the licence server. Check the internet connection and try again." });
       }
-      loginAttempts.delete(req.socket.remoteAddress);
+      loginAttempts.clear(req);
     }
     await license.signOut();
     return send(res, 200, { ok: true }, { 'Set-Cookie': 'flv_staff=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
@@ -407,8 +439,7 @@ async function route(req, res) {
       if (!isLang(lang)) bad('Unknown language.');
       const wait = slowLane(table);
       if (wait) return send(res, 429, { error: 'voice_busy', retryAfter: wait }, { 'Retry-After': String(wait) });
-      const gate = await license.useVoice('transcribe');
-      if (!gate.ok) return suspended(res, gate.status);
+      if (!(await countVoice(req, res, 'transcribe'))) return;
       recent.push(now); transcribeStamps.set(table, recent);
       // Dish names steer Whisper toward the menu's spelling ("burrata", "arrabbiata", "tiramisu").
       const prompt = 'Restaurant order. Menu: ' + store.menu().filter((m) => m.available).map((m) => m.name).join(', ') + '.';
@@ -466,8 +497,7 @@ async function route(req, res) {
       const now = Date.now();
       const recent = (speakStamps.get(table) || []).filter((t) => now - t < 60000);
       if (recent.length >= SPEAK_LIMIT) return send(res, 429, { error: 'rate_limited' });
-      const gate = await license.useVoice('speak');
-      if (!gate.ok) return suspended(res, gate.status);
+      if (!(await countVoice(req, res, 'speak'))) return;
       recent.push(now); speakStamps.set(table, recent);
       try {
         const wav = await whisper.speak(text, body.rate === 'slow' ? 'slow' : 'normal');
@@ -481,8 +511,8 @@ async function route(req, res) {
       const lang = isLang(body.lang) ? body.lang : 'en';
       const wait = slowLane(table, { ticket: true });
       if (wait) return send(res, 429, { error: 'voice_busy', retryAfter: wait }, { 'Retry-After': String(wait) });
-      const gate = await license.useVoice('assistant');
-      if (!gate.ok) return suspended(res, gate.status);
+      // A table already over the assistant's own per-minute limit is refused below without being counted.
+      if (assistant.usage(table).used < RATE_LIMIT && !(await countVoice(req, res, 'assistant'))) return;
       const out = assistant.handle(table, typeof body.text === 'string' ? body.text.slice(0, 1000) : '', lang);
       broadcast();
       return send(res, out.status, out.body, out.status === 429 ? { 'Retry-After': String(out.body.retryAfter) } : {});
@@ -501,7 +531,7 @@ async function route(req, res) {
       return send(res, 503, { error: "Can't reach the licence server. Check the internet connection and try again." });
     }
     if (!ok) return send(res, 401, { error: 'That PIN is not correct.' });
-    loginAttempts.delete(req.socket.remoteAddress);
+    loginAttempts.clear(req);
     const token = randomBytes(32).toString('base64url');
     store.addSession(sha(token), SESSION_TTL);
     return send(res, 200, { ok: true }, { 'Set-Cookie': `flv_staff=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL / 1000}${secureCookie(req)}` });
@@ -586,7 +616,8 @@ export const server = http.createServer(async (req, res) => {
     if (!res.headersSent) send(res, 500, { error: 'Something went wrong. Please try again.' });
   }
 });
-server.listen(PORT, () => {
+// HOST limits which network interface serves the app (all of them by default, for the tablets).
+server.listen(PORT, process.env.HOST || undefined, () => {
   license.start(); // opens the signed-in restaurant's data first, so the lines below describe it
   console.log('Flavoria is running');
   console.log(`  Customer tablets:  ${PUBLIC_URL}/table/1 ... /table/${TABLE_COUNT}`);

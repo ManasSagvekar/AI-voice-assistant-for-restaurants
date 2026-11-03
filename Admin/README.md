@@ -24,7 +24,7 @@ The schema, trigger, RLS policies and RPCs live in [`../supabase/migrations`](..
    npm run create-admin -- you@example.com "a long password"
    ```
 4. From the workspace root (`C:\AI-assistant`), run `npm run dev`. It starts this app and the Voice-assistant behind one address:
-   - http://localhost:3000/admin: this super-admin app (it is built with `basePath: '/admin'`)
+   - http://localhost:3000/admin: this super-admin app (it is built with `basePath: '/admin'`). It answers only on this computer; other devices on the network get a 403. Set `ADMIN_REMOTE=1` before `npm run dev` to open it to the network.
    - http://localhost:3000/restaurant: the restaurant staff dashboard
    - http://localhost:3000/table/1: a guest tablet
 

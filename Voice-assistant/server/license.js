@@ -137,9 +137,15 @@ export function createLicense(store, { url, anonKey, name = 'Restaurant', onBloc
     return ok;
   }
 
-  // Counts one voice request. Returns ok: false when the restaurant is (or has just become) blocked.
+  // Counts one voice request. Returns ok: false when the restaurant is (or has just become) blocked,
+  // and capped: true (with the service still active) when voice is paused for the rest of the window.
   async function useVoice(kind) {
     if (!status().active) return { ok: false, status: status() };
+    // Three times the limit in one window flags the restaurant for abuse and revokes access, and the
+    // tablets are open to anyone on the network. So this server stops counting at twice the limit and
+    // pauses voice until the window resets: guests can never get their own restaurant locked out.
+    // (Only with the soft-limit migration, which reports usage per window.)
+    if (access && 'throttled' in access && access.limit > 0 && access.usage >= access.limit * 2) return { ok: false, capped: true, status: status() };
     try {
       setAccess(await sb.rpc('increment_usage', { p_restaurant_id: access.restaurant_id, p_kind: kind }, await token()));
       lastError = '';

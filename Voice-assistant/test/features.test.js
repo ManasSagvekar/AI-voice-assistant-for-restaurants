@@ -150,6 +150,28 @@ test('a paid restaurant keeps serving while offline until its plan ends, and rep
   });
 });
 
+test('voice stops counting at twice the limit, so guests can never get the restaurant flagged for abuse', async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'tazte-cap-test-'));
+  const store = createStore(path.join(directory, 'restaurant.db'));
+  try {
+    const seed = (usage) => {
+      store.setting('license_refresh_token', 'stored-token');
+      store.setting('license_access', JSON.stringify({ name: 'Bistro', reason: null, allowed: true, usage, limit: 100, warn: true, throttled: usage >= 100,
+        subscription_expires_at: new Date(Date.now() + 864e5).toISOString(), checkedAt: Date.now() }));
+      // An unreachable Supabase: a capped request must be refused before any network call.
+      return createLicense(store, { url: 'http://127.0.0.1:9', anonKey: 'anon' });
+    };
+    const capped = await seed(200).useVoice('assistant');
+    assert.equal(capped.ok, false);
+    assert.equal(capped.capped, true);
+    assert.equal(capped.status.active, true, 'the restaurant itself stays in service');
+    assert.equal((await seed(150).useVoice('assistant')).capped, undefined, 'below twice the limit it is still counted');
+  } finally {
+    store.db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('replies follow the guest language, and voice can cancel a just-sent order', () => {
   withStore((store) => {
     const a = createAssistant(store);
