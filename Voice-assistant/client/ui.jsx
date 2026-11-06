@@ -120,6 +120,7 @@ export async function api(path, method = 'GET', body) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     if (res.status === 403 && data.error === 'service_suspended') serviceChanged();
+    if (res.status === 423) window.dispatchEvent(new Event('table-lost')); // staff released this table
     throw new ApiError(res.status, data);
   }
   return data;

@@ -7,12 +7,26 @@ import { RestaurantTable } from '@/components/RestaurantTable';
 import { AutoRefresh } from '@/components/AutoRefresh';
 import { RemindersButton } from '@/components/RemindersButton';
 
+// Things only the admin can fix, checked from the outside. A failed check says nothing rather than alarm.
+async function securityNotices(db: ReturnType<typeof supabaseAdmin>) {
+  const notices: string[] = [];
+  try {
+    const res = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL!.replace(/\/+$/, '')}/auth/v1/settings`, { headers: { apikey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY! }, next: { revalidate: 3600 } });
+    const settings = res.ok ? await res.json() : null;
+    if (settings && settings.disable_signup === false) notices.push('Anyone can create an account on your Supabase project. Turn it off: in Supabase, open Authentication, then Sign In / Providers, and switch off "Allow new users to sign up". Your onboarding keeps working.');
+  } catch { /* offline */ }
+  const { error } = await db.from('admin_audit_log').select('id', { head: true }).limit(1);
+  if (error) notices.push('The activity log and the database\'s admin protection aren\'t active yet. Apply the migration 20261106000000_admin_security.sql in Supabase.');
+  return notices;
+}
+
 export const dynamic = 'force-dynamic';
 
 export default async function Dashboard() {
   const user = await requireAdmin();
   const db = supabaseAdmin();
-  const [restaurants, usage, alerts] = await Promise.all([
+  const [notices, restaurants, usage, alerts] = await Promise.all([
+    securityNotices(db),
     db.from('restaurants').select(COLUMNS).order('created_at', { ascending: false }),
     db.from('usage_last_24h').select('restaurant_id,requests'),
     db.from('admin_alerts').select('id,restaurant_id,kind,message,created_at').is('resolved_at', null).order('created_at', { ascending: false }).limit(20),
@@ -44,6 +58,7 @@ export default async function Dashboard() {
             </div>
           ))}
         </section>
+        {notices.map((n) => <p key={n} className="warning" role="status">{n}</p>)}
         {open.length > 0 && <AlertsPanel alerts={open} />}
         <RemindersButton />
         <RestaurantTable rows={rows} />

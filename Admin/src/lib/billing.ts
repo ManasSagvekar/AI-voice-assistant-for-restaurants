@@ -5,6 +5,7 @@
 import 'server-only';
 import { createHmac, createHash, timingSafeEqual } from 'node:crypto';
 import { supabaseAdmin } from './supabaseAdmin';
+import { audit } from './audit';
 import { isPlan, planLabel, UUID, type Plan, type Restaurant } from './types';
 
 const PRICE_ENV: Record<Plan, string> = {
@@ -77,11 +78,13 @@ export async function handlePaymentEvent(eventId: string | null, raw: string): P
     await db.from('restaurants').update({ payment_status: 'paid', last_payment_at: new Date().toISOString() }).eq('id', restaurantId);
     const { error } = await db.rpc('extend_subscription', { p_restaurant_id: restaurantId, p_plan: plan });
     if (error) throw new Error(error.message);
+    await audit('Razorpay', 'payment_received', { restaurantId, detail: `${event}, ${plan ?? 'current'} plan` });
     return `paid: ${r.name} extended by one ${plan ?? 'current'} period`;
   }
   if (event === 'subscription.halted') {
     await db.from('restaurants').update({ payment_status: 'unpaid' }).eq('id', restaurantId);
     await db.from('admin_alerts').insert({ restaurant_id: restaurantId, kind: 'payment', message: `${r.name}: Razorpay stopped the subscription after repeated failed payments. Marked unpaid.` });
+    await audit('Razorpay', 'payment_halted', { restaurantId, detail: event });
     return `halted: ${r.name} marked unpaid`;
   }
   if (event === 'subscription.pending') {

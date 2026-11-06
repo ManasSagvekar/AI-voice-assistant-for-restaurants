@@ -22,11 +22,11 @@ export function OnboardForm({ emailConfigured }: { emailConfigured: boolean }) {
       <div className="card stack">
         <h2>{c.name} is onboarded</h2>
         <p className={c.mail.sent ? 'success' : 'warning'}>
-          {c.mail.sent ? `Welcome email sent to ${c.email}.` : `No email was sent: ${c.mail.reason} Share these details securely; the password is not shown again.`}
+          {c.mail.sent ? `Welcome email sent to ${c.email}, with a link to set their password.` : `No email was sent: ${c.mail.reason} Pass these details on securely.`}
         </p>
         <dl className="creds">
           <dt>Username</dt><dd><code>{c.username}</code></dd>
-          <dt>Password</dt><dd><code>{c.password}</code></dd>
+          {c.setPasswordUrl && <><dt>Set-password link</dt><dd><code className="secret">{c.setPasswordUrl}</code><small> Works once, and expires soon. You can send a new one from More on the dashboard.</small></dd></>}
           <dt>Staff PIN</dt><dd><code>{c.pin}</code></dd>
           <dt>Service</dt><dd>{c.status === 'active' ? `Active${c.expires ? ` until ${new Date(c.expires).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}` : ''}` : 'Suspended until payment is marked as received'}</dd>
         </dl>
@@ -63,13 +63,6 @@ export function OnboardForm({ emailConfigured }: { emailConfigured: boolean }) {
         {err.email && <em>{err.email}</em>}
       </label>
 
-      <label className={`field${err.password ? ' invalid' : ''}`}>
-        <span>Password</span>
-        <input name="password" type="text" autoComplete="new-password" placeholder="Leave blank to generate" spellCheck={false} defaultValue={v.password} />
-        <small>Stored hashed by Supabase Auth. Minimum 10 characters.</small>
-        {err.password && <em>{err.password}</em>}
-      </label>
-
       <label className={`field${err.staff_pin ? ' invalid' : ''}`}>
         <span>Staff PIN</span>
         <div className="inline">
@@ -101,13 +94,13 @@ export function OnboardForm({ emailConfigured }: { emailConfigured: boolean }) {
             <option value="hour">per hour</option><option value="day">per day</option>
           </select>
         </div>
-        <small>Reaching it flags the restaurant and revokes access automatically.</small>
+        <small>Reaching it slows voice down until the period resets. Three times the limit revokes access.</small>
         {err.rate_limit_max && <em>{err.rate_limit_max}</em>}
       </label>
 
       <label className="field check">
         <input type="checkbox" name="send_email" defaultChecked={emailConfigured && (!state || v.send_email === 'on')} disabled={!emailConfigured} />
-        <span>Email the login details and staff PIN
+        <span>Email the username, staff PIN and a link to set the password
           <small>{emailConfigured ? 'Sent to the address above once the restaurant is created.' : 'Email is not configured; the details are shown on screen instead.'}</small>
         </span>
       </label>

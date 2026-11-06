@@ -4,7 +4,7 @@ Two apps that share one live database:
 
 | App | Address | Who uses it | Access |
 | --- | --- | --- | --- |
-| Customer tablet | `/table/1` … `/table/8` | Guests, one tablet per table | Open, scoped to its own table |
+| Customer tablet | `https://<computer's address>:3443/table/1` … | Guests, one tablet per table | The first device to open a table holds it until staff release it |
 | Restaurant dashboard | `/restaurant` | Staff | Staff PIN, HttpOnly session cookie (12 h) |
 | Kitchen screen | `/kitchen` | Kitchen | Same staff sign-in |
 | Floor view | `/floor` | Waiters, on their phones | Same staff sign-in |
@@ -35,6 +35,8 @@ Then open `http://localhost:3000`. If you don't set `STAFF_PIN`, the server uses
 | `WHISPER_MODEL` | `small` | Whisper model the service loads. Multilingual models also understand Hindi and Marathi; `small.en` is English-only |
 | `WHISPER_AUTOSTART` | on | Set to `0` to stop `npm start` launching the Whisper service |
 | `PIPER_VOICE` | `en_US-amy-medium` | Assistant voice ([Piper voices](https://huggingface.co/rhasspy/piper-voices)); downloaded on first start |
+| `HTTPS_PORT`, `HTTPS` | `3443`, on | The secure port for tablets. `HTTPS=off` turns it off, but then tablets on the network have no microphone |
+| `TLS_CERT_FILE`, `TLS_KEY_FILE` | unset | Use your own certificate (a real domain name) instead of the one created here |
 | `HOST` | all interfaces | Network interface to listen on. The root `npm run dev` sets `127.0.0.1`, because its proxy on port 3000 is the way in |
 | `SUPABASE_URL`, `SUPABASE_ANON_KEY` | unset | Turns on the restaurant licence (below). Anon key only |
 | `BACKUP_DIR` | `data/backups` | Where nightly database copies go |
@@ -62,9 +64,19 @@ Staff can change the active table count from the dashboard's **Tables** tab (1�
 
 ## Tablets, ordering and service
 
+**Secure connection.** Browsers only allow the microphone on secure pages, and `localhost` is the only plain-HTTP exception, so tablets must use HTTPS. On first start the server creates a small certificate authority and a server certificate for this computer's private network addresses (`data/tls/`, renewed by itself if the address changes). The authority is limited by name constraints to private addresses and `.local` names, so even a stolen key can't impersonate a public website. Set up each tablet once: open `http://<address>:3000/tablet-setup` on it and install the certificate. The tablet and setup addresses are printed in the server window at startup. Plain HTTP from another device redirects to HTTPS (except the setup page) and refuses anything but page loads, so a staff PIN is never sent unencrypted. This computer can still use plain HTTP. Give the computer a fixed address on the router, because tablets are pointed at it.
+
+**One device per table.** The first device to open a table holds it; other devices can't see its orders or order for it, and the home page shows it as in use. A tablet holds one table, and a device on the network can take one new table every ten minutes, so nobody can quietly hold them all. This computer is exempt, for trying things out. Signed-in staff can open any table without taking it. If a tablet is replaced, press **Release** on that table in the **Tables** tab; the old tablet stops and says so, and the next device to open the table takes it over.
+
+**Sizes.** A dish can come in 2 to 6 sizes (Menu Control, **Details**). The tablet shows "from" the lowest price and asks which size; by voice, "two full biryani" uses it, and otherwise the assistant asks. A menu import recognises "Half 120 / Full 220" and size columns under a heading. A range such as "AED 31–38" doesn't say what its prices are for, so staff must choose sizes or one price before publishing.
+
+**Tax and the bill.** In the **Tables** tab, **Tax and bill** sets the tax name and rate, whether menu prices already include it, the service charge, and the address, tax number and closing line on the bill. The service charge is worked out first and is itself taxed. Until this is saved, no tax is charged and the dashboard says so. Each order keeps the rates it was sent with. **Bill**, on a table or a bill request, opens a numbered bill to print on an 80 mm receipt printer. Printing again keeps the number, changed orders make a new bill, and a paid table's last bill prints as a copy.
+
 **Sending an order.** Nothing reaches the kitchen until the guest confirms a read-back: tapping **Send to kitchen** shows the order and total first, and saying "send my order" makes the assistant read it back and wait for a yes. If the owner has chosen a dish to suggest with something in the order (Menu Control, **Details**, "Suggest with this dish"), it is offered once per order. For one minute after sending, and only until the kitchen starts it, the guest can take the order back (**Undo** on the tablet, or "cancel my order"); the dishes return to the cart.
 
-**Importing a menu.** In the dashboard's **Import Menu** tab, drop the restaurant's PDF menu (or a .txt/.csv price list). It is read on the staff computer with PDF.js (`shared/menuparse.js`): each section heading becomes one of the tablet's categories, in the menu's order, and each dish keeps its price and the menu's currency (AED, ₹, $, € and others; the currency then applies to every price in the app). Price ranges such as "AED 31–38" are flagged to check, and diet, spice and allergen tags are only suggestions. Before publishing, staff choose whether the import replaces the current menu (the default while it is still the sample menu) or adds to it, and whether to add dish photos. With photos on, `server/photos.js` finds a free-licensed photo for each dish on Wikipedia, saves it in `data/media/` and serves it from `/media/`, so tablets never load images from the internet; Menu Control, **Details**, can find another photo or remove one, and links each photo's author and licence. Scanned menus and photos of menus have no text to read and are refused with an explanation.
+**Importing a menu.** In the dashboard's **Import Menu** tab, drop the restaurant's PDF menu, photos of its pages, or a .txt/.csv price list. It is read on the staff computer, with PDF.js and, for photos and scanned PDFs, Tesseract (`shared/menuparse.js`), and nothing is uploaded: each section heading becomes one of the tablet's categories, in the menu's order, and each dish keeps its price and the menu's currency (AED, ₹, $, € and others; the currency then applies to every price in the app). Price ranges such as "AED 31–38" are flagged to check, and diet, spice and allergen tags are only suggestions. Before publishing, staff choose whether the import replaces the current menu (the default while it is still the sample menu) or adds to it, and whether to add dish photos. With photos on, `server/photos.js` finds a free-licensed photo for each dish on Wikipedia, saves it in `data/media/` and serves it from `/media/`, so tablets never load images from the internet; Menu Control, **Details**, can find another photo or remove one, and links each photo's author and licence. Photos and scans are read in English. Hold the camera straight above the page, in good light. A misread price would be charged to guests, so publishing from a picture requires ticking that every name and price was checked; lines the reader was unsure of are highlighted, a price that lost its decimal point is recovered and flagged, and a picture that mostly read badly says so and suggests retaking it. iPhone HEIC photos need saving as JPG first.
+
+**Health.** The dashboard's **Health** tab shows whether the licence is working, and what to do when it isn't, with a count on the tab when it needs a look. The dashboard also shows a reminder until tax is set up.
 
 **Allergies.** Each dish has an allergen list and a "the kitchen has checked this list" tick (Menu Control, **Details**). The assistant answers allergy questions ("does the korma have nuts?") only for ticked dishes; otherwise it calls a server and says so. "Nut-free" style filters show only ticked dishes. Every allergy question and its answer is listed under Service Requests. Dishes can also be tagged Jain and Halal.
 
@@ -72,7 +84,7 @@ Staff can change the active table count from the dashboard's **Tables** tab (1�
 
 **Kitchen and floor.** `/kitchen` shows tickets oldest first with a timer against the dish's prep time, a bump button, a sound for new orders and optional printing (80 mm receipt layout; with **Print new tickets**, each ticket prints once the guest's undo minute has passed). `/floor` is for waiters' phones: open requests by waiting time with sound and vibration, seated tables with how long they've been seated, and a "my tables" choice kept on the phone.
 
-**Backups.** The database is copied every night, and soon after start if the last copy is over a day old, to `BACKUP_DIR`, plus `BACKUP_COPY_DIR` if set. The Tables tab shows the last backup and has **Back up now**. To restore, stop the server and replace `data/flavoria.db` with a backup file.
+**Backups.** The database is copied every night, and soon after start if the last copy is over a day old, to `BACKUP_DIR`, plus `BACKUP_COPY_DIR` if set. This runs by itself, with nothing to press in the dashboard. To check on it, look at the dated files in the backup folder. To restore, stop the server and replace the restaurant's database file (`data/restaurants/<restaurant id>.db`, or `data/flavoria.db` in standalone mode) with a backup file.
 
 Tables start **Available** and become **Occupied** when the first order is sent to the kitchen. On upgrade, old session-only occupancy is reconciled against unpaid orders. The staff dashboard's **Tables** tab has a status switch for manually marking a table occupied or available. Guests can only select available tables from the landing page; opening an occupied table URL redirects them back to the table chooser. Marking a bill request paid also returns its table to **Available**.
 
@@ -125,6 +137,8 @@ Two separate front-end apps share one backend:
 - `client/ui.jsx`, `client/tailwind.css`: components and styles shared by both front ends
 - `shared/engine.js`: menu/pricing/guardrail logic used by both the server and the browser
 - `shared/menuparse.js`: reads an uploaded menu's text into sections and dishes (staff browser, tested in Node)
+- `server/health.js`: turns the licence status into the Health tab's card
+- `server/tls.js`: the local certificates behind HTTPS for tablets
 - `server/`: the one HTTP server, SQLite store and assistant pipeline both apps talk to
 - `public/assets/`: the built JS/CSS output for both apps (generated by `npm run build`, not hand-edited)
 

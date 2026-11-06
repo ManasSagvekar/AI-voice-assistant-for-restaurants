@@ -150,7 +150,7 @@ function Row({ r, onResult }: { r: RestaurantRow; onResult: (r: ActionResult) =>
                 <button className="btn small" disabled={pending}>Send payment link</button>
               </form>
               <button className="btn small" disabled={pending} onClick={() => run(() => regeneratePin(r.id), `Give ${r.name} a new staff PIN? The current PIN stops working for new sign-ins.`)}>New staff PIN</button>
-              <button className="btn small" disabled={pending} onClick={() => run(() => resetPassword(r.id), `Reset ${r.name}'s password and email the new one?`)}>Reset password &amp; email</button>
+              <button className="btn small" disabled={pending} onClick={() => run(() => resetPassword(r.id), `Reset ${r.name}'s password? It stops working now, and they get a link to choose a new one. Their connected computers stay connected.`)}>Send set-password link</button>
             </div>
           </details>
         </div>

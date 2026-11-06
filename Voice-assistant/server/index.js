@@ -2,6 +2,7 @@
 // and the staff dashboard (staff-app/, served at /restaurant). One process, one SQLite database, with live
 // updates pushed to both over Server-Sent Events.
 import http from 'node:http';
+import https from 'node:https';
 import { readFile, mkdir } from 'node:fs/promises';
 import { existsSync, mkdirSync } from 'node:fs';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
@@ -12,8 +13,10 @@ import { createAssistant } from './assistant.js';
 import { createWhisper } from './whisper.js';
 import { createLicense } from './license.js';
 import { createBackups } from './backup.js';
-import { validateCall, CATEGORIES, ALLERGEN_KEYS, UNDO_MS, RATE_LIMIT, CURRENCIES, setMenuMeta, fmt } from '../shared/engine.js';
+import { validateCall, CATEGORIES, ALLERGEN_KEYS, UNDO_MS, RATE_LIMIT, CURRENCIES, setMenuMeta, fmt, hasSizes, sizeId } from '../shared/engine.js';
 import { createPhotos } from './photos.js';
+import { healthChecks } from './health.js';
+import { createTls, networkAddresses } from './tls.js';
 import { isLang } from '../shared/i18n.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -130,15 +133,16 @@ const clientIp = (req) => {
   const forwarded = LOOPBACK.test(peer) && req.headers['x-forwarded-for'];
   return forwarded ? String(forwarded).split(',').pop().trim() : peer;
 };
-// At most `max` events per address per minute. Old addresses are dropped so the map can't grow forever.
-function perAddress(max) {
+const isThisComputer = (req) => LOOPBACK.test(clientIp(req));
+// At most `max` events per address per window. Old addresses are dropped so the map can't grow forever.
+function perAddress(max, windowMs = 60000) {
   const seen = new Map();
   return {
     allow(req) {
       const ip = clientIp(req), now = Date.now();
-      if (seen.size > 5000) for (const [k, v] of seen) if (now - v[v.length - 1] > 60000) seen.delete(k);
-      const recent = (seen.get(ip) || []).filter((t) => now - t < 60000);
-      if (recent.length >= max) { seen.set(ip, recent); return Math.ceil((recent[0] + 60000 - now) / 1000); }
+      if (seen.size > 5000) for (const [k, v] of seen) if (now - v[v.length - 1] > windowMs) seen.delete(k);
+      const recent = (seen.get(ip) || []).filter((t) => now - t < windowMs);
+      if (recent.length >= max) { seen.set(ip, recent); return Math.ceil((recent[0] + windowMs - now) / 1000); }
       recent.push(now); seen.set(ip, recent);
       return 0;
     },
@@ -150,6 +154,19 @@ const allowAttempt = (req) => !loginAttempts.allow(req);
 // Counted voice requests per device, so one device (or one person on the network) can't spend the
 // restaurant's voice allowance. A tablet in normal use stays far below this.
 const voiceBudget = perAddress(40);
+// A device on the network can take one new table every ten minutes, so nobody can quietly hold them
+// all. This computer is exempt: it is where the restaurant tries things out.
+const claimBudget = perAddress(1, 10 * 60e3);
+
+// ---------- HTTPS ----------
+// Browsers only allow the microphone on secure pages. Plain HTTP stays for this computer (and for the
+// tablet setup page); everyone else is sent to HTTPS. HTTPS=off turns all of this off.
+const HTTPS_PORT = Number(process.env.HTTPS_PORT) || 3443;
+const tls = process.env.HTTPS === 'off' ? null : createTls(path.join(path.dirname(DB_FILE), 'tls'));
+let httpsUp = false;
+const PUBLIC_PORT = new URL(PUBLIC_URL).port || '80';
+const secureUrl = (host, rest = '') => `https://${host}${HTTPS_PORT === 443 ? '' : `:${HTTPS_PORT}`}${rest}`;
+const tabletAddresses = () => networkAddresses().map((ip) => ({ secure: secureUrl(ip), setup: `http://${ip}${PUBLIC_PORT === '80' ? '' : `:${PUBLIC_PORT}`}/tablet-setup` }));
 
 // ---------- backups ----------
 const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(DB_FILE), 'backups');
@@ -174,9 +191,9 @@ const tabletSettings = () => ({
 const clients = new Set();
 const tableSnapshot = (t) => ({ table: t, menu: store.menu(), meta: store.menuMeta(), cart: store.cart(t), note: store.note(t), orders: store.tableOrders(t), requests: store.requests(t), usage: assistant.usage(t), now: Date.now() });
 const adminSnapshot = () => ({
-  tables: TABLES, menu: store.menu(), meta: store.menuMeta(), photosPending, orders: store.recentOrders(), requests: store.requests(), security: store.security(),
+  tables: TABLES, menu: store.menu(), meta: store.menuMeta(), photosPending, claims: store.claims(), orders: store.recentOrders(), requests: store.requests(), security: store.security(),
   occupancy: store.tableStatuses(TABLES), settings: tabletSettings(),
-  backup: backups.status(), allergenLog: store.allergenLog(), undoMs: UNDO_MS,
+  allergenLog: store.allergenLog(), undoMs: UNDO_MS,
   carts: Object.fromEntries(TABLES.map((t) => [t, store.cart(t).reduce((s, l) => s + l.qty, 0)])), now: Date.now(),
 });
 let pending = null;
@@ -240,10 +257,25 @@ async function readAudio(req, maxBytes) {
 }
 const cookies = (req) => Object.fromEntries((req.headers.cookie || '').split(';').map((c) => c.trim().split('=')).filter((p) => p[0]).map(([k, ...v]) => [k, decodeURIComponent(v.join('='))]));
 const isStaff = (req) => { const t = cookies(req).flv_staff; return !!t && store.hasSession(sha(t)); };
-const secureCookie = (req) => (req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : '');
+const isSecure = (req) => !!req.socket.encrypted || (LOOPBACK.test(req.socket.remoteAddress || '') && req.headers['x-forwarded-proto'] === 'https');
+const secureCookie = (req) => (isSecure(req) ? '; Secure' : '');
+// Which table this device holds. Staff may open any table's screen without holding it.
+const TABLE_TOKEN_TTL = 365 * 864e5;
+const deviceToken = (req) => { const t = cookies(req).flv_table; return t ? sha(t) : null; };
+function holdsTable(req, table) {
+  const claim = store.claimOf(table);
+  const token = deviceToken(req);
+  return !!claim && !!token && claim.tokenHash === token;
+}
+const mayUseTable = (req, table) => {
+  if (isStaff(req)) return true;
+  if (!holdsTable(req, table)) return false;
+  store.touchClaim(table);
+  return true;
+};
 const sameOrigin = (req) => { try { return !req.headers.origin || new URL(req.headers.origin).host === req.headers.host; } catch { return false; } };
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.avif': 'image/avif', '.jpg': 'image/jpeg', '.webp': 'image/webp',
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.avif': 'image/avif', '.jpg': 'image/jpeg', '.webp': 'image/webp', '.crt': 'application/x-x509-ca-cert',
   '.mjs': 'text/javascript; charset=utf-8', '.wasm': 'application/wasm', '.onnx': 'application/octet-stream' };
 // The customer and staff apps each keep their own HTML + client source; only the built
 // JS/CSS bundle output and the backend below are shared between them.
@@ -265,9 +297,31 @@ const CAT_IDS = CATEGORIES.map((c) => c.id).filter((c) => c !== 'all' && c !== '
 const MEALS = ['breakfast', 'lunch', 'dinner'];
 const str = (v, max, field) => (typeof v === 'string' && v.trim().length > 0 && v.length <= max ? v.trim() : bad(`${field} must be 1-${max} characters.`));
 const money = (v) => (typeof v === 'number' && isFinite(v) && v >= 0.5 && v <= 100000 ? Math.round(v * 100) / 100 : bad('Price must be between 0.50 and 100,000.'));
+// Sizes as sent by staff, or null for a dish with one price. Two to six, with different names.
+function sizeList(v) {
+  if (v === null || (Array.isArray(v) && !v.length)) return null;
+  if (!Array.isArray(v) || v.length < 2 || v.length > 6) bad('A dish needs 2 to 6 sizes, or none.');
+  const sizes = v.map((sz) => ({ id: sizeId(str(sz && sz.label, 24, 'Size name')), label: str(sz.label, 24, 'Size name'), price: money(sz.price) }));
+  if (sizes.some((sz) => !sz.id) || new Set(sizes.map((sz) => sz.id)).size !== sizes.length) bad('Each size needs its own name.');
+  return sizes;
+}
+const percent = (v, label) => (typeof v === 'number' && isFinite(v) && v >= 0 && v <= 50 ? Math.round(v * 1000) / 1000 : bad(`${label} must be between 0 and 50 percent.`));
+const text = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+function billingDetails(body) {
+  return {
+    taxRate: percent(body.taxRate, 'Tax'), serviceRate: percent(body.serviceRate, 'Service charge'), taxIncluded: body.taxIncluded === true,
+    taxLabel: text(body.taxLabel, 16) || 'Tax', address: text(body.address, 200), taxId: text(body.taxId, 40), footer: text(body.footer, 120),
+  };
+}
 function itemPatch(body, itemId) {
   const p = {};
-  if ('price' in body) p.price = money(body.price);
+  if ('sizes' in body) {
+    p.sizes = sizeList(body.sizes);
+    if (p.sizes) p.price = Math.min(...p.sizes.map((sz) => sz.price));
+  } else if ('price' in body) {
+    if (hasSizes(store.item(itemId))) bad('This dish has sizes. Change the price of each size in Details.');
+    p.price = money(body.price);
+  }
   if ('available' in body) p.available = body.available === true;
   if ('diet' in body) p.diet = ['veg', 'nonveg'].includes(body.diet) ? body.diet : bad('Diet must be veg or nonveg.');
   for (const k of ['vegan', 'gf', 'chefSpecial', 'jain', 'halal', 'allergensChecked']) if (k in body) p[k] = body[k] === true;
@@ -287,8 +341,10 @@ function itemPatch(body, itemId) {
   return p;
 }
 function newItem(r, categories) {
+  const sizes = sizeList(r.sizes ?? null);
   return {
-    name: str(r.name, 80, 'Name'), desc: typeof r.desc === 'string' ? r.desc.slice(0, 200) : '', price: money(r.price),
+    name: str(r.name, 80, 'Name'), desc: typeof r.desc === 'string' ? r.desc.slice(0, 200) : '',
+    price: sizes ? Math.min(...sizes.map((sz) => sz.price)) : money(r.price), ...(sizes ? { sizes } : {}),
     category: categories.has(r.category) ? r.category : bad('Unknown category.'),
     // Other names guests may use for the dish ("chapati" for "Tandoori Roti / Chapati").
     aliases: Array.isArray(r.aliases) ? r.aliases.filter((a) => typeof a === 'string' && a.length >= 2 && a.length <= 60).slice(0, 6) : [],
@@ -335,13 +391,28 @@ async function route(req, res) {
   const method = req.method;
   let r;
 
+  // Everything except the setup page, which a tablet needs before it trusts the certificate.
+  const setupPage = p === '/tablet-setup' || p === '/tablet-ca.crt';
+  if (httpsUp && !isSecure(req) && !isThisComputer(req) && !setupPage) {
+    if (method !== 'GET' && method !== 'HEAD') return send(res, 426, { error: 'Please use the secure address of this restaurant.' });
+    const host = (req.headers.host || '').replace(/:\d+$/, '');
+    if (/^[\w.-]+$/.test(host)) { res.writeHead(302, { Location: secureUrl(host, req.url), 'Cache-Control': 'no-store' }); return res.end(); }
+  }
+
   // pages
+  if (method === 'GET' && p === '/tablet-setup') return serveFile(res, CUSTOMER_PUBLIC, 'tablet-setup.html');
+  if (method === 'GET' && p === '/tablet-ca.crt') {
+    if (!tls || !tls.caCert) return send(res, 404, { error: 'This restaurant uses its own certificate, so there is nothing to install.' });
+    res.writeHead(200, { 'Content-Type': 'application/x-x509-ca-cert', 'Content-Disposition': 'attachment; filename="tablet-ca.crt"', 'Cache-Control': 'no-store', ...SECURITY_HEADERS });
+    return res.end(tls.caCert);
+  }
   if (method === 'GET' && p === '/') return serveFile(res, CUSTOMER_PUBLIC, 'index.html');
   if (method === 'GET' && (r = p.match(/^\/table\/(\d{1,2})\/?$/))) {
     const table = 'T' + Number(r[1]);
     if (!TABLES.includes(table)) return serveFile(res, CUSTOMER_PUBLIC, 'index.html');
-    // Guests pick a table on the landing page, so an occupied one sends them back.
-    if (store.tableStatuses([table])[table]) {
+    // Guests pick a table on the landing page, so one that is occupied or held by another device sends
+    // them back. The device holding the table, and staff, can always open it.
+    if (!holdsTable(req, table) && !isStaff(req) && (store.claimOf(table) || store.tableStatuses([table])[table])) {
       res.writeHead(303, { Location: '/', 'Cache-Control': 'no-store' });
       return res.end();
     }
@@ -357,8 +428,10 @@ async function route(req, res) {
   if (method === 'GET' && p === '/api/config') {
     const s = license.status();
     const occupancy = store.tableStatuses(TABLES);
+    const mine = deviceToken(req) ? store.claimedBy(deviceToken(req)) : [];
     return send(res, 200, {
-      tables: TABLES, busy: s.active ? TABLES.filter((t) => occupancy[t]) : [],
+      tables: TABLES, busy: s.active ? TABLES.filter((t) => occupancy[t]) : [], mine,
+      held: s.active ? TABLES.filter((t) => store.claimOf(t) && !mine.includes(t)) : [],
       restaurant: s.name, service: { state: s.state, active: s.active, linked: s.linked, offline: s.offline, usage: s.usage },
     });
   }
@@ -424,6 +497,27 @@ async function route(req, res) {
     const table = r[1];
     if (!TABLES.includes(table)) return send(res, 404, { error: 'Unknown table.' });
     const sub = r[2] || '';
+    if (sub === '/claim') {
+      const staff = isStaff(req);
+      if (method === 'GET') return send(res, 200, { mine: holdsTable(req, table), held: !!store.claimOf(table), staff });
+      if (method !== 'POST') return send(res, 404, { error: 'Not found' });
+      if (staff || holdsTable(req, table)) return send(res, 200, { ok: true, staff });
+      if (store.claimOf(table)) return send(res, 423, { error: 'table_held' });
+      // A tablet belongs to one table, except on this computer, where the restaurant tries things out.
+      const token = deviceToken(req);
+      const local = isThisComputer(req);
+      const own = !local && token ? store.claimedBy(token).filter((t) => TABLES.includes(t)) : [];
+      if (own.length) return send(res, 423, { error: 'device_has_table', table: own[0] });
+      if (!local) {
+        const wait = claimBudget.allow(req);
+        if (wait) return send(res, 429, { error: 'claim_limit', retryAfter: wait }, { 'Retry-After': String(wait) });
+      }
+      const fresh = token ? null : randomBytes(32).toString('base64url');
+      if (!store.claimTable(table, fresh ? sha(fresh) : token)) return send(res, 423, { error: 'table_held' });
+      broadcast();
+      return send(res, 200, { ok: true }, fresh ? { 'Set-Cookie': `flv_table=${fresh}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${TABLE_TOKEN_TTL / 1000}${secureCookie(req)}` } : {});
+    }
+    if (!mayUseTable(req, table)) return send(res, 423, { error: 'table_held' });
     if (method === 'GET' && sub === '/events') return openStream(req, res, { role: 'table', table });
     if (method === 'GET' && sub === '') return send(res, 200, tableSnapshot(table));
     if (method === 'POST' && sub === '/transcribe') {
@@ -456,10 +550,12 @@ async function route(req, res) {
     const body = method === 'DELETE' ? {} : await readJson(req);
 
     if (method === 'POST' && sub === '/cart') {
-      const v = validateCall({ tool: 'add_to_cart', args: { item_id: body.itemId, qty: body.qty, modifiers: body.mods } }, store.menu());
+      const v = validateCall({ tool: 'add_to_cart', args: { item_id: body.itemId, qty: body.qty, modifiers: body.mods, ...(body.size ? { size: body.size } : {}) } }, store.menu());
       if (!v.ok || v.stripped.length) bad(v.errors[0] || 'That option is not available for this dish.');
-      if (!store.item(v.args.item_id).available) return send(res, 409, { error: 'That dish is unavailable tonight.' });
-      store.addToCart(table, v.args.item_id, v.args.qty, v.args.modifiers);
+      const dish = store.item(v.args.item_id);
+      if (!dish.available) return send(res, 409, { error: 'That dish is unavailable tonight.' });
+      if (hasSizes(dish) && !v.args.size) bad('Choose a size for this dish.');
+      store.addToCart(table, v.args.item_id, v.args.qty, v.args.modifiers, v.args.size || null);
     } else if (method === 'PATCH' && (r = sub.match(/^\/cart\/([\w-]+)$/))) {
       if (![-1, 1].includes(body.delta)) bad('delta must be 1 or -1.');
       if (!store.changeQty(table, r[1], body.delta)) return send(res, 404, { error: 'Line not found.' });
@@ -540,6 +636,7 @@ async function route(req, res) {
     if (!isStaff(req)) return send(res, 401, { error: 'Staff login required.' });
     const sub = p.slice('/api/admin'.length);
     if (method === 'GET' && sub === '/me') return send(res, 200, { ok: true });
+    if (method === 'GET' && sub === '/health') return send(res, 200, healthChecks({ now: Date.now(), licence: license.status(), licensed: license.licensed }));
     if (method === 'GET' && sub === '/events') return openStream(req, res, { role: 'admin' });
     if (method === 'POST' && sub === '/logout') {
       store.dropSession(sha(cookies(req).flv_staff));
@@ -584,12 +681,20 @@ async function route(req, res) {
       if (!TABLES.includes(r[1])) return send(res, 404, { error: 'Unknown table.' });
       if (typeof body.occupied !== 'boolean') bad('occupied must be a boolean.');
       store.setTableOccupied(r[1], body.occupied);
+    } else if (method === 'POST' && (r = sub.match(/^\/tables\/(T\d{1,2})\/release$/))) {
+      store.releaseTable(r[1]);
+      for (const c of clients) if (c.role === 'table' && c.table === r[1]) { c.res.end(); clients.delete(c); }
+    } else if (method === 'POST' && (r = sub.match(/^\/tables\/(T\d{1,2})\/bill$/))) {
+      if (!TABLES.includes(r[1])) return send(res, 404, { error: 'Unknown table.' });
+      const bill = store.createBill(r[1], { restaurant: license.status().name });
+      if (!bill) return send(res, 404, { error: 'This table has no orders to bill yet.' });
+      return send(res, 200, bill);
+    } else if (method === 'PATCH' && sub === '/settings/billing') {
+      store.setMenuMeta({ billing: billingDetails(body) });
+      setMenuMeta(store.menuMeta());
     } else if (method === 'PATCH' && sub === '/settings/tablets') {
       if ('vad' in body) store.setting('tablet_vad', ['normal', 'noisy'].includes(body.vad) ? body.vad : bad('Unknown microphone setting.'));
       if ('voicePrivacy' in body) store.setting('voice_privacy', ['standard', 'offline'].includes(body.voicePrivacy) ? body.voicePrivacy : bad('Unknown voice setting.'));
-    } else if (method === 'POST' && sub === '/backup') {
-      const out = backups.run();
-      if (out.error) return send(res, 500, { error: `Backup failed: ${out.error}` });
     } else if (method === 'PATCH' && sub === '/settings/table-count') {
       if (!Number.isInteger(body.count) || body.count < 1 || body.count > 99) bad('Table count must be an integer from 1 to 99.');
       TABLE_COUNT = body.count;
@@ -609,13 +714,28 @@ async function route(req, res) {
   return send(res, 404, { error: 'Not found' });
 }
 
-export const server = http.createServer(async (req, res) => {
+const handler = async (req, res) => {
   try { await route(req, res); } catch (e) {
     if (e instanceof HttpError) return send(res, e.status, { error: e.message });
     console.error(e);
     if (!res.headersSent) send(res, 500, { error: 'Something went wrong. Please try again.' });
   }
-});
+};
+export const server = http.createServer(handler);
+// Tablets on the network come in here. It listens on every interface even when HOST keeps plain HTTP
+// on this computer, and carries on without HTTPS if the port is taken.
+function startHttps() {
+  if (!tls) return;
+  const secure = https.createServer({ key: tls.key, cert: tls.cert }, handler);
+  secure.on('error', (e) => console.error(`  HTTPS:             not available on port ${HTTPS_PORT} (${e.code || e.message}). Tablets on the network can't use the microphone.`));
+  secure.listen(HTTPS_PORT, () => {
+    httpsUp = true;
+    broadcast();
+    for (const a of tabletAddresses()) console.log(`  Tablets:           ${a.secure}/table/1   (set up each tablet once: ${a.setup})`);
+  });
+  // A changed network address needs a new certificate; tablets keep trusting the same authority.
+  setInterval(() => { const next = tls.refresh(); if (next) { secure.setSecureContext(next); broadcast(); console.log('[https] Network address changed: certificate renewed.'); } }, 5 * 60e3).unref();
+}
 // HOST limits which network interface serves the app (all of them by default, for the tablets).
 server.listen(PORT, process.env.HOST || undefined, () => {
   license.start(); // opens the signed-in restaurant's data first, so the lines below describe it
@@ -625,6 +745,7 @@ server.listen(PORT, process.env.HOST || undefined, () => {
   console.log(`  Database:          ${DB_FILE}`);
   console.log(`  Licence:           ${license.licensed ? license.status().state : 'standalone (no SUPABASE_URL)'}`);
   console.log(`  Backups:           ${backups.status().dir}${process.env.BACKUP_COPY_DIR ? ' + ' + process.env.BACKUP_COPY_DIR : ''}`);
+  startHttps();
   backups.start();
   whisper.start();
 });

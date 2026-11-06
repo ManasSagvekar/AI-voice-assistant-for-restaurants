@@ -8,7 +8,8 @@
     "build": "next build",
     "start": "next start --port 3100",
     "typecheck": "tsc --noEmit",
-    "create-admin": "node scripts/create-admin.mjs"
+    "create-admin": "node scripts/create-admin.mjs",
+    "reset-admin-2fa": "node scripts/reset-admin-2fa.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "0.12.7",

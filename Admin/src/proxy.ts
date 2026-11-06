@@ -4,8 +4,9 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
 
 export async function proxy(request: NextRequest) {
-  // Webhook and cron routes check their own signature or secret; they are never signed in.
-  if (request.nextUrl.pathname.startsWith('/api/')) return NextResponse.next();
+  // Webhook and cron routes check their own signature or secret; they are never signed in. Nor are
+  // restaurants following a link to set their password.
+  if (request.nextUrl.pathname.startsWith('/api/') || request.nextUrl.pathname.startsWith('/set-password')) return NextResponse.next();
   let response = NextResponse.next({ request });
   const supabase = createServerClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
     cookies: {

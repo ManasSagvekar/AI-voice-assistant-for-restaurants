@@ -2,7 +2,7 @@
 // Every write goes through here; callers broadcast the change afterwards.
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
-import { SEED_MENU, totals, priceLine } from '../shared/engine.js';
+import { SEED_MENU, DEFAULT_BILLING, billing, totals, priceLine, sizeOf, hasSizes, withSize } from '../shared/engine.js';
 
 const now = () => Date.now();
 const id = (p) => p + randomBytes(4).toString('hex').toUpperCase();
@@ -49,6 +49,14 @@ export function createStore(file) {
     );
     CREATE TABLE IF NOT EXISTS staff_sessions (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    -- The one device each table belongs to, until staff release it. Only a hash of its token is kept.
+    CREATE TABLE IF NOT EXISTS table_claims (
+      table_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, claimed_at INTEGER NOT NULL, last_seen INTEGER NOT NULL
+    );
+    -- Printed bills: numbered in order, each with a copy of what it said.
+    CREATE TABLE IF NOT EXISTS bills (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, table_id TEXT NOT NULL, created_at INTEGER NOT NULL, order_ids TEXT NOT NULL, data TEXT NOT NULL
+    );
     DROP TABLE IF EXISTS devices; -- tablet pairing was removed
     DROP TABLE IF EXISTS pairing_codes;
     CREATE TABLE IF NOT EXISTS allergen_log (
@@ -58,6 +66,13 @@ export function createStore(file) {
   `);
 
   const q = (sql) => db.prepare(sql);
+  // Columns added after the first release, for databases that already exist.
+  const addColumn = (table, column, type) => {
+    if (!q(`PRAGMA table_info(${table})`).all().some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  };
+  addColumn('cart_lines', 'size', 'TEXT');
+  addColumn('orders', 'service', 'REAL NOT NULL DEFAULT 0');
+  addColumn('orders', 'billing', 'TEXT');
   const tx = (fn) => (...args) => {
     db.exec('BEGIN IMMEDIATE');
     try { const r = fn(...args); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; }
@@ -87,6 +102,12 @@ export function createStore(file) {
     if (patch.vegan || patch.jain) next.diet = 'veg';
     if (patch.diet === 'nonveg') { next.vegan = false; next.jain = false; }
     saveItem(next);
+    // Carts can't keep a size that no longer exists, or a line without one on a dish that now needs it.
+    if ('sizes' in patch && hasSizes(next)) {
+      for (const l of q('SELECT id, size FROM cart_lines WHERE item_id = ?').all(itemId)) {
+        if (!sizeOf(next, l.size)) q('DELETE FROM cart_lines WHERE id = ?').run(l.id);
+      }
+    }
     return next;
   });
 
@@ -112,27 +133,31 @@ export function createStore(file) {
     return insertItems(rows);
   });
 
-  // The restaurant's currency and its imported menu sections ([{ id, label }]).
+  // The restaurant's currency, imported menu sections ([{ id, label }]) and tax and bill details.
+  // billingSet stays false until staff save those details, so the dashboard can ask for them.
   const menuMeta = () => {
     let sections = [];
+    let saved = null;
     try { sections = JSON.parse(setting('menu_sections') || '[]'); } catch { /* keep none */ }
-    return { currency: setting('currency') || 'USD', sections };
+    try { saved = JSON.parse(setting('billing') || 'null'); } catch { /* keep none */ }
+    return { currency: setting('currency') || 'USD', sections, billing: { ...DEFAULT_BILLING, ...saved }, billingSet: !!saved };
   };
-  const setMenuMeta = ({ currency, sections }) => {
+  const setMenuMeta = ({ currency, sections, billing: details }) => {
     if (currency) setting('currency', currency);
     if (sections) setting('menu_sections', JSON.stringify(sections));
+    if (details) setting('billing', JSON.stringify(details));
   };
 
   // ---------- carts ----------
-  const cart = (table) => q('SELECT id, item_id, qty, mods FROM cart_lines WHERE table_id = ? ORDER BY created_at')
-    .all(table).map((r) => ({ id: r.id, itemId: r.item_id, qty: r.qty, mods: JSON.parse(r.mods) }));
+  const cart = (table) => q('SELECT id, item_id, qty, mods, size FROM cart_lines WHERE table_id = ? ORDER BY created_at')
+    .all(table).map((r) => ({ id: r.id, itemId: r.item_id, qty: r.qty, mods: JSON.parse(r.mods), size: r.size || null }));
   const note = (table) => (q('SELECT note FROM table_notes WHERE table_id = ?').get(table) || {}).note || '';
 
-  const writeToCart = (table, itemId, qty, mods) => {
+  const writeToCart = (table, itemId, qty, mods, size = null) => {
     const key = [...mods].sort().join(',');
-    const same = cart(table).find((l) => l.itemId === itemId && [...l.mods].sort().join(',') === key);
+    const same = cart(table).find((l) => l.itemId === itemId && l.size === size && [...l.mods].sort().join(',') === key);
     if (same) q('UPDATE cart_lines SET qty = ? WHERE id = ?').run(Math.min(10, same.qty + qty), same.id);
-    else q('INSERT INTO cart_lines (id, table_id, item_id, qty, mods, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id('L'), table, itemId, Math.min(10, qty), json(mods), now());
+    else q('INSERT INTO cart_lines (id, table_id, item_id, qty, mods, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id('L'), table, itemId, Math.min(10, qty), json(mods), size, now());
   };
   const addToCart = tx(writeToCart);
   const changeQty = tx((table, lineId, delta) => {
@@ -163,7 +188,8 @@ export function createStore(file) {
   // ---------- orders ----------
   const rowToOrder = (r) => ({
     id: r.id, table: r.table_id, status: r.status, createdAt: r.created_at, kitchenAt: r.kitchen_at, servedAt: r.served_at,
-    prepMins: r.prep_mins, note: r.note, lines: JSON.parse(r.lines), subtotal: r.subtotal, tax: r.tax, total: r.total, paid: !!r.paid,
+    prepMins: r.prep_mins, note: r.note, lines: JSON.parse(r.lines), subtotal: r.subtotal, service: r.service, tax: r.tax, total: r.total, paid: !!r.paid,
+    billing: r.billing ? JSON.parse(r.billing) : null,
   });
   const tableOrders = (table) => q('SELECT * FROM orders WHERE table_id = ? AND paid = 0 ORDER BY created_at DESC').all(table).map(rowToOrder);
   const recentOrders = () => q('SELECT * FROM orders WHERE status != ? OR served_at > ? ORDER BY created_at DESC LIMIT 100').all('served', now() - 3 * 3600e3).map(rowToOrder);
@@ -178,10 +204,12 @@ export function createStore(file) {
     const seq = q('SELECT COALESCE(MAX(seq), 2040) s FROM orders').get().s + 1;
     const order = {
       id: 'ORD-' + seq, prepMins: Math.min(45, Math.max(...items.map((i) => i.prep)) + (lines.length - 1) * 2),
-      lines: lines.map((l) => { const p = priceLine(m, l); return { itemId: l.itemId, name: m.find((x) => x.id === l.itemId).name, qty: l.qty, mods: l.mods, unit: p.unit, total: p.total }; }),
+      lines: lines.map((l) => { const p = priceLine(m, l); const it = m.find((x) => x.id === l.itemId); return { itemId: l.itemId, name: withSize(it.name, it, l.size), size: l.size, qty: l.qty, mods: l.mods, unit: p.unit, total: p.total }; }),
     };
-    q(`INSERT INTO orders (id, seq, table_id, status, created_at, prep_mins, note, lines, subtotal, tax, total)
-       VALUES (?, ?, ?, 'received', ?, ?, ?, ?, ?, ?, ?)`).run(order.id, seq, table, now(), order.prepMins, note(table), json(order.lines), t.subtotal, t.tax, t.total);
+    // Each order keeps the amounts and rates it was sent with, whatever staff change later.
+    const { taxRate, taxLabel, taxIncluded, serviceRate } = billing();
+    q(`INSERT INTO orders (id, seq, table_id, status, created_at, prep_mins, note, lines, subtotal, service, tax, total, billing)
+       VALUES (?, ?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(order.id, seq, table, now(), order.prepMins, note(table), json(order.lines), t.subtotal, t.service, t.tax, t.total, json({ taxRate, taxLabel, taxIncluded, serviceRate }));
     writeTableOccupied(table, true);
     clearTable(table);
     return order.id;
@@ -192,7 +220,11 @@ export function createStore(file) {
     const r = q('SELECT * FROM orders WHERE id = ? AND table_id = ? AND paid = 0').get(orderId, table);
     if (!r) return { ok: false, reason: 'not_found' };
     if (r.status !== 'received' || r.created_at < now() - windowMs) return { ok: false, reason: 'too_late' };
-    for (const l of JSON.parse(r.lines)) if (item(l.itemId)) writeToCart(table, l.itemId, l.qty, l.mods);
+    for (const l of JSON.parse(r.lines)) {
+      const it = item(l.itemId);
+      if (!it || (hasSizes(it) && !sizeOf(it, l.size))) continue;
+      writeToCart(table, l.itemId, l.qty, l.mods, sizeOf(it, l.size) ? l.size : null);
+    }
     if (r.note) setNote(table, note(table) ? `${note(table)}; ${r.note}` : r.note);
     q('DELETE FROM orders WHERE id = ?').run(orderId);
     return { ok: true, id: orderId };
@@ -208,6 +240,60 @@ export function createStore(file) {
     else if (r.status === 'kitchen') q("UPDATE orders SET status = 'served', served_at = ? WHERE id = ?").run(now(), orderId);
     return true;
   };
+
+  // ---------- printed bills ----------
+  // The bill for a table's open orders. Printing it again keeps its number; orders added or taken back
+  // since then make it a new bill. With nothing open, the table's last bill can be printed again.
+  const createBill = tx((table, { restaurant }) => {
+    const orders = tableOrders(table).reverse();
+    const last = q('SELECT * FROM bills WHERE table_id = ? ORDER BY seq DESC LIMIT 1').get(table);
+    if (!orders.length) return last ? { ...JSON.parse(last.data), reprint: true } : null;
+    const ids = json(orders.map((o) => o.id));
+    const open = q("SELECT split FROM service_requests WHERE table_id = ? AND type = 'bill' AND status != 'done' ORDER BY created_at DESC LIMIT 1").get(table);
+    const split = open ? open.split : 1;
+    if (last && last.order_ids === ids) {
+      const again = { ...JSON.parse(last.data), split };
+      q('UPDATE bills SET data = ? WHERE seq = ?').run(json(again), last.seq);
+      return again;
+    }
+    const merged = new Map();
+    for (const l of orders.flatMap((o) => o.lines)) {
+      const key = `${l.itemId}|${l.size || ''}|${[...l.mods].sort().join(',')}`;
+      const m = merged.get(key);
+      if (m) { m.qty += l.qty; m.total += l.total; } else merged.set(key, { name: l.name, mods: l.mods, qty: l.qty, unit: l.unit, total: l.total });
+    }
+    const sum = (k) => Math.round(orders.reduce((s, o) => s + o[k], 0) * 100) / 100;
+    // The rates to print, when all the orders were sent with the same ones.
+    const rates = orders.map((o) => json(o.billing));
+    const details = menuMeta().billing;
+    const at = now();
+    const data = {
+      table, at, orders: orders.map((o) => o.id), restaurant, address: details.address, taxId: details.taxId, footer: details.footer,
+      lines: [...merged.values()], subtotal: sum('subtotal'), service: sum('service'), tax: sum('tax'), total: sum('total'), split,
+      billing: new Set(rates).size === 1 ? orders[0].billing : null, taxLabel: (orders[orders.length - 1].billing || details).taxLabel,
+    };
+    const { lastInsertRowid } = q('INSERT INTO bills (table_id, created_at, order_ids, data) VALUES (?, ?, ?, ?)').run(table, at, ids, json(data));
+    data.number = Number(lastInsertRowid);
+    q('UPDATE bills SET data = ? WHERE seq = ?').run(json(data), lastInsertRowid);
+    return data;
+  });
+
+  // ---------- table claims ----------
+  // A table belongs to the first device that opens it, until staff release it.
+  const claimOf = (table) => {
+    const r = q('SELECT token_hash, claimed_at, last_seen FROM table_claims WHERE table_id = ?').get(table);
+    return r ? { tokenHash: r.token_hash, claimedAt: r.claimed_at, lastSeen: r.last_seen } : null;
+  };
+  const claimedBy = (tokenHash) => q('SELECT table_id FROM table_claims WHERE token_hash = ? ORDER BY claimed_at').all(tokenHash).map((r) => r.table_id);
+  const claimTable = tx((table, tokenHash) => {
+    if (claimOf(table)) return false;
+    q('INSERT INTO table_claims (table_id, token_hash, claimed_at, last_seen) VALUES (?, ?, ?, ?)').run(table, tokenHash, now(), now());
+    return true;
+  });
+  const touchClaim = (table) => q('UPDATE table_claims SET last_seen = ? WHERE table_id = ? AND last_seen < ?').run(now(), table, now() - 60e3);
+  const releaseTable = (table) => q('DELETE FROM table_claims WHERE table_id = ?').run(table).changes > 0;
+  const claims = () => Object.fromEntries(q('SELECT table_id, claimed_at, last_seen FROM table_claims').all()
+    .map((r) => [r.table_id, { claimedAt: r.claimed_at, lastSeen: r.last_seen }]));
 
   // ---------- service requests ----------
   const rowToReq = (r) => ({ id: r.id, table: r.table_id, type: r.type, detail: r.detail, split: r.split, status: r.status, at: r.created_at });
@@ -264,6 +350,6 @@ export function createStore(file) {
     db, menu, item, updateItem, publishItems, replaceMenu, menuMeta, setMenuMeta, cart, note, addToCart, changeQty, removeLine, removeItem, setNote, resetTable,
     tableOrders, recentOrders, placeOrder, cancelOrder, latestOrder, advanceOrder, requests, addRequest, setRequestStatus, tableStatuses, setTableOccupied,
     logSecurity, security, setting, addSession, hasSession, dropSession, dropAllSessions,
-    logAllergen, allergenLog, backupTo,
+    logAllergen, allergenLog, backupTo, createBill, claimOf, claimedBy, claimTable, touchClaim, releaseTable, claims,
   };
 }

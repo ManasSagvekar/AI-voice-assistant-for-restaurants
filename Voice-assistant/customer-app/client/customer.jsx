@@ -1,5 +1,5 @@
 import {
-  IDLE_LIMIT, WARN_AT, MAX_TURN_MS, LONG_TURN_MS, RATE_LIMIT, TAX_RATE, UNDO_MS, fmt, CATEGORIES, CURRENCIES, currency, menuCategories, catLabel, MODIFIERS, ALLERGENS, allowedMods, priceLine, totals,
+  IDLE_LIMIT, WARN_AT, MAX_TURN_MS, LONG_TURN_MS, RATE_LIMIT, UNDO_MS, fmt, billing, hasSizes, sizeOf, withSize, cheapestSize, CATEGORIES, CURRENCIES, currency, menuCategories, catLabel, MODIFIERS, ALLERGENS, allowedMods, priceLine, totals,
   EMPTY_FILTERS, matchesFilters, describeFilters, sanitizeTranscript, upsellFor,
 } from '../../shared/engine.js';
 import { LANGS, ui, labels, dishName, allergenName } from '../../shared/i18n.js';
@@ -125,8 +125,53 @@ function TableApp() {
     <RestaurantContext.Provider value={cfg || { restaurant: '', service: { state: 'active', active: true, linked: true } }}>
       {!cfg ? <Loading label="Connecting to the restaurant…" />
         : !cfg.service.active ? <ServicePaused state={cfg.service.state} />
-        : <TableScreen table={table} />}
+        : <ClaimedTable table={table} />}
     </RestaurantContext.Provider>
+  );
+}
+
+// A table belongs to the first device that opens it, until staff release it. Opening it claims it;
+// after that the tablet checks it still holds it, and a released tablet waits to be set up again
+// instead of quietly taking the table back from the device that replaced it.
+function ClaimedTable({ table }) {
+  const [state, setState] = useState({ status: 'checking' });
+  const claim = useCallback(async () => {
+    try {
+      await api(`/api/tables/${table}/claim`, 'POST', {});
+      setState({ status: 'ok' });
+    } catch (e) {
+      const error = e.body && e.body.error;
+      if (error === 'device_has_table') location.replace('/table/' + e.body.table.slice(1));
+      else if (error === 'table_held') setState({ status: 'held' });
+      else if (error === 'claim_limit') setState({ status: 'limit' });
+      else setTimeout(claim, 3000); // not reachable yet
+    }
+  }, [table]);
+  useEffect(() => { claim(); }, [claim]);
+  useEffect(() => {
+    const check = () => fetch(`/api/tables/${table}/claim`, { cache: 'no-store' }).then((r) => r.json())
+      .then((d) => { if (!d.mine && !d.staff) setState((s) => (s.status === 'ok' ? { status: 'released' } : s)); }).catch(() => {});
+    const id = setInterval(check, 15000);
+    window.addEventListener('table-lost', check);
+    return () => { clearInterval(id); window.removeEventListener('table-lost', check); };
+  }, [table]);
+  if (state.status === 'checking') return <Loading label="Opening this table…" />;
+  if (state.status === 'ok') return <TableScreen table={table} />;
+  const [title, text] = {
+    held: [`${tableName(table)} is in use`, "It's open on another device. If this is your table, ask a member of staff to release it."],
+    limit: ['Please ask a member of staff', 'This device has opened a table very recently. Staff can set this table up for you.'],
+    released: [`This tablet was released from ${tableName(table)}`, 'Staff released it. If it should stay at this table, tap below.'],
+  }[state.status];
+  return (
+    <main className="gutter min-h-[100vh] flex items-center justify-center text-center">
+      <div className="w-full max-w-md glass rounded-3xl p-8" role="status">
+        <h1 className="font-serif text-3xl">{title}</h1>
+        <p className="text-sm text-muted mt-2">{text}</p>
+        {state.status === 'released'
+          ? <button className="btn-gold justify-center mt-5" onClick={claim}>Use this tablet for {tableName(table)}</button>
+          : <a className="btn-outline justify-center mt-5 inline-flex" href="/">See the tables</a>}
+      </div>
+    </main>
   );
 }
 
@@ -304,11 +349,11 @@ function Tablet({ table, state, voice, setVoiceState, toast, now, t }) {
   const cartTotals = totals(menu, cart);
   const L = labels(lang);
 
-  const addLine = useCallback(async (itemId, qty, mods) => {
+  const addLine = useCallback(async (itemId, qty, mods, size) => {
     const item = menu.find((m) => m.id === itemId);
-    if (!(await call('/cart', 'POST', { itemId, qty, mods }))) return false;
+    if (!(await call('/cart', 'POST', { itemId, qty, mods, ...(size ? { size } : {}) }))) return false;
     setCartPulse((p) => p + 1);
-    pushFeed(`Touch: added ${qty} × ${item.name}${mods.length ? ' (' + modsText(mods) + ')' : ''} · ${fmt(priceLine(menu, { itemId, qty, mods }).total)}`);
+    pushFeed(`Touch: added ${qty} × ${withSize(item.name, item, size)}${mods.length ? ' (' + modsText(mods) + ')' : ''} · ${fmt(priceLine(menu, { itemId, qty, mods, size }).total)}`);
     toast(`${dishName(item, lang)} ✓`);
     return true;
   }, [menu, call, pushFeed, toast, lang]);
@@ -432,11 +477,11 @@ function Tablet({ table, state, voice, setVoiceState, toast, now, t }) {
             liveFeed={liveFeed} orders={tableOrders} onSend={() => { setDrawer(false); setConfirm(true); }} requestBill={requestBill} requests={requests}
             undoOrder={undoOrder} callServer={() => serverFree && callServer()} />
           {confirm && <ConfirmOrder menu={menu} cart={cart} note={state.note} upsell={upsell} onSend={placeOrder} onClose={() => setConfirm(false)}
-            onAddUpsell={async (item) => { setUpsellDone(true); await addLine(item.id, 1, []); }} onSkipUpsell={() => setUpsellDone(true)} />}
+            onAddUpsell={async (item) => { setUpsellDone(true); const small = cheapestSize(item); await addLine(item.id, 1, [], small && small.id); }} onSkipUpsell={() => setUpsellDone(true)} />}
           {sent && <OrderSent sent={sent} now={now} onUndo={() => undoOrder(sent.id)} onClose={() => setSent(null)} />}
           {customizing && <Customizer item={menu.find((m) => m.id === customizing.id)} onClose={() => setCustomizing(null)}
             onAsk={() => callServer(`Allergy question about the ${customizing.name}`)}
-            onAdd={async (qty, mods) => { if (await addLine(customizing.id, qty, mods)) setCustomizing(null); }} />}
+            onAdd={async (qty, mods, size) => { if (await addLine(customizing.id, qty, mods, size)) setCustomizing(null); }} />}
           {remaining <= WARN_AT && <StillThere remaining={remaining} onStay={() => { bump(); setRemaining(IDLE_LIMIT); }} />}
         </div>
       )}
@@ -638,7 +683,7 @@ function ProductCard({ item, onAdd, onVoice }) {
           {item.gf && <span className="mini-tag">GF</span>}
         </div>
         <div className="mt-auto pt-3 flex items-center justify-between gap-2">
-          <span className="font-serif text-xl text-ink tabular-nums">{fmt(item.price)}</span>
+          <span className="font-serif text-xl text-ink tabular-nums">{hasSizes(item) ? t.fromPrice(fmt(item.price)) : fmt(item.price)}</span>
           <div className="flex items-center gap-1.5">
             <button onClick={onVoice} disabled={off} title={`Say "Add ${item.name}"`} aria-label={`Order ${item.name} by voice`} className="w-9 h-9 rounded-full border border-line flex items-center justify-center text-gold-dark hover:border-gold disabled:opacity-40 disabled:cursor-not-allowed">
               <Icon name="mic" className="w-4 h-4" />
@@ -656,11 +701,12 @@ function Customizer({ item, onClose, onAdd, onAsk }) {
   const t = ui(prefs.lang);
   const [qty, setQty] = useState(1);
   const [mods, setMods] = useState([]);
+  const [size, setSize] = useState(hasSizes(item) ? item.sizes[0].id : null);
   const [asked, setAsked] = useState(false);
   const allowed = allowedMods(item);
   const exclusive = ['medium_rare', 'medium', 'well_done'];
   const toggle = (k) => setMods((m) => (m.includes(k) ? m.filter((x) => x !== k) : [...m.filter((x) => !(exclusive.includes(k) && exclusive.includes(x)) && !(k === 'mild' && x === 'extra_spicy') && !(k === 'extra_spicy' && x === 'mild')), k]));
-  const line = priceLine([item], { itemId: item.id, qty, mods });
+  const line = priceLine([item], { itemId: item.id, qty, mods, size });
   const allergens = item.allergens.map((a) => allergenName(prefs.lang, a, ALLERGENS[a] ? ALLERGENS[a].label : a)).join(', ');
   return (
     <div className="fixed inset-0 z-[55] bg-ink/40 flex items-end sm:items-center justify-center sm:gutter" onClick={onClose}>
@@ -679,7 +725,19 @@ function Customizer({ item, onClose, onAdd, onAsk }) {
               <button type="button" disabled={asked} onClick={() => { setAsked(true); onAsk(); }} className="font-semibold underline disabled:no-underline disabled:opacity-60">{asked ? t.serverOnWay : t.askAllergens}</button>
             </div>
           )}
-          <p className="label mt-4 mb-2">{t.makeItYours}</p>
+          {hasSizes(item) && (
+            <>
+              <p className="label mt-4 mb-2">{t.chooseSize}</p>
+              <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={t.chooseSize}>
+                {item.sizes.map((s) => (
+                  <button key={s.id} role="radio" aria-checked={size === s.id} onClick={() => setSize(s.id)} className={'chip ' + (size === s.id ? 'chip-on' : '')}>
+                    {s.label} <span className="opacity-70 tabular-nums">{fmt(s.price)}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+          {allowed.length > 0 && <p className="label mt-4 mb-2">{t.makeItYours}</p>}
           <div className="flex flex-wrap gap-2">
             {allowed.map((k) => (
               <button key={k} onClick={() => toggle(k)} aria-pressed={mods.includes(k)} className={'chip ' + (mods.includes(k) ? 'chip-on' : '')}>
@@ -693,7 +751,7 @@ function Customizer({ item, onClose, onAdd, onAsk }) {
               <span className="w-6 text-center tabular-nums font-medium">{qty}</span>
               <button className="w-10 h-10 text-lg" onClick={() => setQty((q) => Math.min(10, q + 1))} aria-label="Increase quantity">+</button>
             </div>
-            <button className="btn-gold flex-1 justify-between" onClick={() => onAdd(qty, mods)}><span>{t.addToOrder}</span><span className="tabular-nums">{fmt(line.total)}</span></button>
+            <button className="btn-gold flex-1 justify-between" onClick={() => onAdd(qty, mods, size)}><span>{t.addToOrder}</span><span className="tabular-nums">{fmt(line.total)}</span></button>
           </div>
         </div>
       </div>
@@ -702,6 +760,19 @@ function Customizer({ item, onClose, onAdd, onAsk }) {
 }
 
 // Read-back before anything reaches the kitchen, with the owner's suggested pairing offered once.
+// Subtotal, service charge and tax, as this restaurant has set them up.
+function AmountRows({ tot, t }) {
+  const b = billing();
+  const label = `${b.taxLabel === 'Tax' ? t.tax : b.taxLabel} ${b.taxRate}%`;
+  return (
+    <>
+      <div className="flex justify-between text-muted"><span>{t.subtotal}</span><span>{fmt(tot.subtotal)}</span></div>
+      {b.serviceRate > 0 && <div className="flex justify-between text-muted mt-1"><span>{t.service} {b.serviceRate}%</span><span>{fmt(tot.service)}</span></div>}
+      {b.taxRate > 0 && <div className="flex justify-between text-muted mt-1"><span>{b.taxIncluded ? t.included(label) : label}</span><span>{fmt(tot.tax)}</span></div>}
+    </>
+  );
+}
+
 function ConfirmOrder({ menu, cart, note, upsell, onSend, onClose, onAddUpsell, onSkipUpsell }) {
   const { prefs } = usePrefs();
   const t = ui(prefs.lang);
@@ -719,7 +790,7 @@ function ConfirmOrder({ menu, cart, note, upsell, onSend, onClose, onAddUpsell, 
             const item = menu.find((m) => m.id === l.itemId);
             return (
               <li key={l.id} className="py-2.5 flex justify-between gap-3">
-                <span className="min-w-0"><span className="font-semibold tabular-nums">{l.qty} ×</span> {dishName(item, prefs.lang)}{l.mods.length > 0 && <span className="block text-[13px] text-muted">{modsText(l.mods)}</span>}</span>
+                <span className="min-w-0"><span className="font-semibold tabular-nums">{l.qty} ×</span> {withSize(dishName(item, prefs.lang), item, l.size)}{l.mods.length > 0 && <span className="block text-[13px] text-muted">{modsText(l.mods)}</span>}</span>
                 <span className="tabular-nums shrink-0">{fmt(priceLine(menu, l).total)}</span>
               </li>
             );
@@ -731,7 +802,7 @@ function ConfirmOrder({ menu, cart, note, upsell, onSend, onClose, onAddUpsell, 
             <div className="w-14 h-14 rounded-xl overflow-hidden shrink-0 bg-sand"><DishImage item={upsell.item} /></div>
             <div className="min-w-0 flex-1">
               <p className="label">{t.goesWell}</p>
-              <p className="font-medium">{dishName(upsell.item, prefs.lang)}</p>
+              <p className="font-medium">{withSize(dishName(upsell.item, prefs.lang), upsell.item, (cheapestSize(upsell.item) || {}).id)}</p>
             </div>
             <div className="flex flex-col gap-1 items-end">
               <button className="btn-gold py-1.5 px-3 text-sm" onClick={() => onAddUpsell(upsell.item)}>{t.addFor(fmt(upsell.item.price))}</button>
@@ -740,8 +811,7 @@ function ConfirmOrder({ menu, cart, note, upsell, onSend, onClose, onAddUpsell, 
           </div>
         )}
         <div className="mt-4 text-sm tabular-nums">
-          <div className="flex justify-between text-muted"><span>{t.subtotal}</span><span>{fmt(tot.subtotal)}</span></div>
-          <div className="flex justify-between text-muted"><span>{t.tax}</span><span>{fmt(tot.tax)}</span></div>
+          <AmountRows tot={tot} t={t} />
           <div className="flex justify-between font-serif text-2xl mt-1"><span>{t.total}</span><span>{fmt(tot.total)}</span></div>
         </div>
         <div className="mt-5 grid grid-cols-2 gap-3">
@@ -1114,6 +1184,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
   // Which way this tablet can listen right now, or why it can't.
   function micBlocker() {
     const { prefs: p, voice: v, t: tt } = ctx.current;
+    if (!window.isSecureContext) return 'Voice needs the secure address of this restaurant. Ask a member of staff, or tap to order.';
     const whisper = engineRef.current === 'whisper' && navigator.mediaDevices && window.AudioContext;
     if (p.lang !== 'en' && !(whisper && (v.languages || []).includes(p.lang))) return tt.languageNeedsWhisper;
     if (!whisper && v.offlineOnly) return tt.offlineNoMic; // the browser recognizer sends audio to Google
@@ -1375,7 +1446,7 @@ function CartDrawer({ open, onClose, table, menu, cart, note, saveNote, call, no
                       <div className="w-14 h-14 rounded-xl overflow-hidden shrink-0 bg-sand"><DishImage item={item} /></div>
                       <div className="flex-1 min-w-0">
                         <div className="flex justify-between gap-2">
-                          <p className="font-medium text-[14px] leading-snug">{dishName(item, prefs.lang)}</p>
+                          <p className="font-medium text-[14px] leading-snug">{withSize(dishName(item, prefs.lang), item, l.size)}</p>
                           <p className="tabular-nums text-[14px]">{item.available ? fmt(p.total) : '—'}</p>
                         </div>
                         {l.mods.length > 0 && <p className="text-[12px] text-muted mt-0.5">{l.mods.map((k) => MODIFIERS[k].label + (MODIFIERS[k].price ? ` +${fmt(MODIFIERS[k].price)}` : '')).join(' · ')}</p>}
@@ -1402,8 +1473,7 @@ function CartDrawer({ open, onClose, table, menu, cart, note, saveNote, call, no
               className="w-full rounded-xl border border-line bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gold/50 resize-none" />
           </section>
           <section className="rounded-2xl bg-white/70 border border-white/80 p-4 text-sm tabular-nums">
-            <div className="flex justify-between text-muted"><span>{t.subtotal}</span><span>{fmt(tot.subtotal)}</span></div>
-            <div className="flex justify-between text-muted mt-1"><span>{t.tax} ({(TAX_RATE * 100).toFixed(3)}%)</span><span>{fmt(tot.tax)}</span></div>
+            <AmountRows tot={tot} t={t} />
             <div className="flex justify-between font-serif text-xl mt-2 pt-2 border-t border-line"><span>{t.total}</span><span>{fmt(tot.total)}</span></div>
             <p className="text-[11px] text-muted mt-2">Prices are calculated by the restaurant's pricing engine.</p>
             <button onClick={onSend} disabled={!cart.length} className="btn-gold w-full justify-center mt-3 disabled:bg-[#CFC6B8] disabled:cursor-not-allowed">{t.sendToKitchen}</button>

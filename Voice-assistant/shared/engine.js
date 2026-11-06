@@ -1,7 +1,6 @@
 // Flavoria "backend" engine: menu data, pricing, guardrails, intent parser, schema validator.
 // Everything here is pure so it can move server-side unchanged.
 
-export const TAX_RATE = 0.08875;
 export const IDLE_LIMIT = 90;          // seconds of inactivity before a session resets
 export const WARN_AT = 30;             // seconds remaining when the "still there?" alert fires
 export const MAX_TURN_MS = 12000;      // max length of a single speech turn
@@ -36,12 +35,16 @@ const allergensIn = (t) => ALLERGEN_KEYS.filter((k) => ALLERGENS[k].re.test(t));
 // The restaurant's currency and its own menu sections (from an imported menu). The server sets them
 // for the restaurant in use; tablets and staff screens from each live snapshot.
 export const CURRENCIES = { USD: '$', AED: 'AED ', INR: '₹', EUR: '€', GBP: '£', SAR: 'SAR ', QAR: 'QAR ', KWD: 'KWD ', OMR: 'OMR ', BHD: 'BHD ', SGD: 'S$', MYR: 'RM ', PKR: 'Rs ' };
-const menuMeta = { currency: 'USD', sections: [] };
-export function setMenuMeta({ currency, sections } = {}) {
+// Rates are percentages. taxIncluded: menu prices already contain the tax (VAT-inclusive menus).
+export const DEFAULT_BILLING = { taxRate: 0, taxLabel: 'Tax', taxIncluded: false, serviceRate: 0, address: '', taxId: '', footer: '' };
+const menuMeta = { currency: 'USD', sections: [], billing: DEFAULT_BILLING };
+export function setMenuMeta({ currency, sections, billing } = {}) {
   if (CURRENCIES[currency]) menuMeta.currency = currency;
   if (Array.isArray(sections)) menuMeta.sections = sections;
+  if (billing) menuMeta.billing = { ...DEFAULT_BILLING, ...billing };
 }
 export const currency = () => menuMeta.currency;
+export const billing = () => menuMeta.billing;
 export const fmt = (n) => CURRENCIES[menuMeta.currency] + (Math.round(n * 100) / 100).toFixed(2);
 
 const U = (id) => `https://images.unsplash.com/photo-${id}?auto=format&fit=crop&w=640&q=70`;
@@ -135,20 +138,45 @@ export const SEED_MENU = [
 ].map((m) => ({ available: true, ...m }));
 
 // ---------- Pricing engine (sole source of truth for money) ----------
+// ---------- Sizes ----------
+// A dish may come in sizes ([{ id, label, price }]); its `price` is then the lowest of them.
+export const hasSizes = (item) => !!(item && item.sizes && item.sizes.length);
+export const sizeOf = (item, sizeId) => (hasSizes(item) && item.sizes.find((s) => s.id === sizeId)) || null;
+export const cheapestSize = (item) => (hasSizes(item) ? [...item.sizes].sort((a, b) => a.price - b.price)[0] : null);
+export const sizeId = (label) => norm(label).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+// "Mutton Biryani (Half)" for tickets and read-backs.
+export const withSize = (name, item, id) => { const s = sizeOf(item, id); return s ? `${name} (${s.label})` : name; };
+// The size named in what a guest said, if any.
+export function sizeIn(item, text) {
+  if (!hasSizes(item)) return null;
+  const t = ` ${norm(text)} `;
+  return item.sizes.find((s) => t.includes(` ${norm(s.label)} `)) || null;
+}
+
 export function priceLine(menu, line) {
   const item = menu.find((m) => m.id === line.itemId);
   if (!item) return { unit: 0, modsTotal: 0, total: 0 };
   const modsTotal = (line.mods || []).reduce((s, k) => s + ((MODIFIERS[k] && MODIFIERS[k].price) || 0), 0);
-  const unit = item.price + modsTotal;
+  const size = sizeOf(item, line.size);
+  const unit = (size ? size.price : item.price) + modsTotal;
   return { unit, modsTotal, total: unit * line.qty };
+}
+const money2 = (n) => Math.round(n * 100) / 100;
+// Service charge, then tax on food and service together. With tax-inclusive prices the tax is shown
+// but not added on top.
+export function billAmounts(subtotal, b = menuMeta.billing) {
+  const service = money2(subtotal * (b.serviceRate / 100));
+  const gross = subtotal + service;
+  const rate = b.taxRate / 100;
+  const tax = money2(b.taxIncluded ? gross - gross / (1 + rate) : gross * rate);
+  return { subtotal: money2(subtotal), service, tax, total: money2(b.taxIncluded ? gross : gross + tax) };
 }
 export function totals(menu, lines) {
   const subtotal = lines.reduce((s, l) => {
     const item = menu.find((m) => m.id === l.itemId);
     return item && item.available ? s + priceLine(menu, l).total : s;
   }, 0);
-  const tax = subtotal * TAX_RATE;
-  return { subtotal, tax, total: subtotal + tax };
+  return billAmounts(subtotal);
 }
 
 // The dish the owner pairs with something already in the cart, if it isn't there yet.
@@ -367,7 +395,10 @@ export function parseIntent(raw, menu) {
     hits.forEach((h, i) => {
       const tail = t.slice(h.end, i + 1 < hits.length ? hits[i + 1].start : t.length);
       const mods = Object.keys(MODIFIERS).filter((k) => MODIFIERS[k].re.test(tail));
-      const args = { item_id: h.item.id, qty: qtyBefore(t.slice(i ? hits[i - 1].end : 0, h.start)), modifiers: mods };
+      const head = t.slice(i ? hits[i - 1].end : 0, h.start);
+      const size = sizeIn(h.item, `${head} ${tail}`);
+      const spoken = size ? head.replace(new RegExp(`\\b${norm(size.label)}\\b`), ' ') : head;
+      const args = { item_id: h.item.id, qty: qtyBefore(spoken), modifiers: mods, ...(size ? { size: size.id } : {}) };
       // A naive LLM would happily copy a user-stated price into the call. The validator must strip it.
       if (priceAttempt) args.unit_price = parseFloat(priceAttempt[0].replace(/[^0-9.]/g, ''));
       calls.push({ tool: 'add_to_cart', args });
@@ -400,7 +431,7 @@ const TOOL_SCHEMAS = {
   allergen_check: { item_id: 'menu_item', allergen: T.oneOf(ALLERGEN_KEYS) },
   cancel_order: {},
   clear_filters: {},
-  add_to_cart: { item_id: 'menu_item', qty: T.int(1, 10), modifiers: 'modifier_list' },
+  add_to_cart: { item_id: 'menu_item', qty: T.int(1, 10), modifiers: 'modifier_list', size: 'item_size' },
   remove_from_cart: { item_id: 'menu_item' },
   describe_item: { item_id: 'menu_item' },
   call_server: { reason: T.str(80) },
@@ -422,6 +453,9 @@ export function validateCall(call, menu) {
     const rule = schema[k];
     if (rule === 'menu_item') {
       if (!menu.some((m) => m.id === v)) errors.push(`${k}: "${v}" is not on the menu`);
+      else args[k] = v;
+    } else if (rule === 'item_size') {
+      if (!sizeOf(menu.find((m) => m.id === call.args.item_id), v)) errors.push(`${k}: "${v}" is not a size of this dish`);
       else args[k] = v;
     } else if (rule === 'modifier_list') {
       const item = menu.find((m) => m.id === call.args.item_id);

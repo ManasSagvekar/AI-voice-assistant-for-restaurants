@@ -75,8 +75,8 @@ Open [http://localhost:3100/admin](http://localhost:3100/admin). For welcome ema
 
 ## Connect a restaurant to Supabase licensing
 
-1. Apply both Supabase migrations and configure the Admin app as described above.
-2. In Admin, onboard a restaurant and provide its login credentials.
+1. Apply the Supabase migrations and configure the Admin app as described above.
+2. In Admin, onboard a restaurant. It chooses its own password from a single-use link.
 3. In `Voice-assistant/.env`, set `SUPABASE_URL` and `SUPABASE_ANON_KEY` to the **same** Supabase project. The Voice Assistant must only use the anon key; do not put the service role key there.
 4. Start the Voice Assistant and connect it with the restaurant credentials. Staff then use the restaurant’s configured PIN.
 
@@ -98,6 +98,25 @@ cd Admin
 npm run typecheck
 npm run build
 ```
+
+## Code graph for AI coding tools
+
+[code-review-graph](https://github.com/tirth8205/code-review-graph) (MIT) keeps a local map of this code's functions, callers and tests, so Claude Code can read only what a change touches. It is a developer tool, not a dependency of either app. The map is stored in `.code-review-graph/`, which git ignores, and its documentation says builds and reviews make no network calls and it has no telemetry.
+
+`CLAUDE.md` and `.claude/skills/` are part of the repository. `.mcp.json` holds a path on one computer, so git ignores it and each computer creates its own. To set it up on Windows, from the repository root:
+
+```sh
+python -m venv "%LOCALAPPDATA%\code-review-graph\venv"
+"%LOCALAPPDATA%\code-review-graph\venv\Scripts\python" -m pip install code-review-graph==2.3.9
+"%LOCALAPPDATA%\code-review-graph\venv\Scripts\code-review-graph" install --platform claude-code --no-hooks -y
+"%LOCALAPPDATA%\code-review-graph\venv\Scripts\code-review-graph" build
+```
+
+Then add `"--auto-watch"` after `"serve"` in `.mcp.json` and restart Claude Code. If you start Claude Code from a parent folder, it needs a copy of `.mcp.json` there too.
+
+- **Updates:** the watcher runs while Claude Code does and updates the map as files are edited. `--no-hooks` leaves git commits untouched.
+- **New files:** a full build only reads committed files. A new file is added once it is committed, or edited while the watcher runs.
+- **Removing it:** run `code-review-graph uninstall --dry-run` to preview, then `code-review-graph uninstall`.
 
 ## Data and deployment notes
 

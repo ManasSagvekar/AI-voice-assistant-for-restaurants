@@ -39,4 +39,4 @@ if (user) {
 }
 const { error } = await db.from('admins').upsert({ user_id: user.id });
 if (error) { console.error(error.message); process.exit(1); }
-console.log('Admin access granted. Sign in at http://localhost:3000/admin/login (npm run dev from the workspace root)');
+console.log('Admin access granted. Sign in at http://localhost:3000/admin/login (npm run dev from the workspace root).');

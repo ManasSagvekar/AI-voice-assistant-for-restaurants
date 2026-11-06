@@ -12,6 +12,7 @@ export function Header({ alerts = 0, email }: { alerts?: number; email?: string 
           </a>
         )}
         <span className="spacer" />
+        <Link href="/activity" className="btn ghost">Activity</Link>
         <Link href="/restaurants/new" className="btn primary">Onboard restaurant</Link>
         <form action={signOut}>
           <button className="btn ghost" title={email}>Sign out</button>

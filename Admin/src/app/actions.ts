@@ -4,7 +4,9 @@
 import { revalidatePath } from 'next/cache';
 import { requireAdmin } from '@/lib/auth';
 import { supabaseAdmin } from '@/lib/supabaseAdmin';
-import { generatePassword, generatePin } from '@/lib/credentials';
+import { generatePin, unknownPassword } from '@/lib/credentials';
+import { audit } from '@/lib/audit';
+import { linkReachable, setPasswordLink } from '@/lib/passwordLink';
 import { sendAccessEmail, type EmailOutcome } from '@/lib/email';
 import { createPaymentLink } from '@/lib/billing';
 import { sendDueReminders } from '@/lib/reminders';
@@ -29,25 +31,38 @@ async function authUserId(id: string) {
   return (data?.auth_user_id as string | null) ?? null;
 }
 // Wraps an action so expected failures come back as messages instead of error pages.
-const guard = async (fn: () => Promise<ActionResult>): Promise<ActionResult> => {
-  await requireAdmin();
-  try { return await fn(); } catch (e) { return fail((e as Error).message); }
+// A successful one is added to the activity log.
+const guard = async (log: { action: string; id?: string; detail?: string }, fn: () => Promise<ActionResult>): Promise<ActionResult> => {
+  const admin = await requireAdmin();
+  try {
+    const result = await fn();
+    if (result.ok) await audit(admin.email, log.action, { restaurantId: log.id, detail: log.detail });
+    return result;
+  } catch (e) { return fail((e as Error).message); }
 };
+// Sends a restaurant its set-password link. A link that only works on this computer, or an email that
+// couldn't go out, is handed to the admin to pass on instead.
+async function sendPasswordLink(kind: 'welcome' | 'password', r: Restaurant): Promise<{ mail: EmailOutcome; url: string | null }> {
+  const link = await setPasswordLink(r.email);
+  if ('error' in link) return { mail: { sent: false, reason: link.error }, url: null };
+  if (!linkReachable()) return { mail: { sent: false, reason: 'Set ADMIN_PUBLIC_URL to send this link by email: it currently only works on this computer.' }, url: link.url };
+  const mail = await sendAccessEmail(kind, r, { setPasswordUrl: link.url });
+  return { mail, url: mail.sent ? null : link.url };
+}
 
 // ---------- onboarding ----------
 export type CreateState = {
   error?: string;
   fields?: Record<string, string>;
   values?: Record<string, string>; // echoed back so a failed submit doesn't clear the form
-  created?: { name: string; username: string; email: string; password: string; pin: string; status: string; expires: string | null; mail: EmailOutcome };
+  created?: { name: string; username: string; email: string; setPasswordUrl: string | null; pin: string; status: string; expires: string | null; mail: EmailOutcome };
 } | null;
 
 export async function createRestaurant(_prev: CreateState, form: FormData): Promise<CreateState> {
-  await requireAdmin();
+  const admin = await requireAdmin();
   const name = String(form.get('name') ?? '').trim();
   const username = String(form.get('username') ?? '').trim().toLowerCase();
   const email = String(form.get('email') ?? '').trim().toLowerCase();
-  const password = String(form.get('password') ?? '') || generatePassword();
   const chosenPin = String(form.get('staff_pin') ?? '').trim();
   const plan = form.get('plan');
   const paid = form.get('paid') === 'on';
@@ -61,7 +76,6 @@ export async function createRestaurant(_prev: CreateState, form: FormData): Prom
   if (!name || name.length > 120) fields.name = 'Enter the restaurant name (up to 120 characters).';
   if (!USERNAME.test(username)) fields.username = '3–40 characters: lowercase letters, numbers, dot, dash or underscore.';
   if (!EMAIL.test(email)) fields.email = 'Enter a valid email address.';
-  if (password.length < 10 || password.length > 72) fields.password = 'Use 10–72 characters, or leave blank to generate one.';
   if (chosenPin && !PIN.test(chosenPin)) fields.staff_pin = 'The PIN must be exactly 6 digits.';
   if (!isPlan(plan)) fields.plan = 'Choose a plan.';
   if (!Number.isInteger(limit) || limit < 1 || limit > 10_000_000) fields.rate_limit_max = 'Enter a whole number of requests.';
@@ -85,7 +99,7 @@ export async function createRestaurant(_prev: CreateState, form: FormData): Prom
   if (!row) return invalid({}, 'Could not generate a unique staff PIN. Try again.');
 
   const { data: user, error: authError } = await db.auth.admin.createUser({
-    email, password, email_confirm: true, app_metadata: { role: 'restaurant' }, user_metadata: { username, restaurant: name },
+    email, password: unknownPassword(), email_confirm: true, app_metadata: { role: 'restaurant' }, user_metadata: { username, restaurant: name },
   });
   if (authError || !user.user) {
     await db.from('restaurants').delete().eq('id', row.id);
@@ -99,16 +113,18 @@ export async function createRestaurant(_prev: CreateState, form: FormData): Prom
     if (extended) row = { ...row, ...(extended as Restaurant) };
   }
 
-  const mail: EmailOutcome = notify ? await sendAccessEmail('welcome', row, { password }) : { sent: false, reason: 'You chose not to send an email.' };
+  const { mail: sent, url: setPasswordUrl } = await sendPasswordLink('welcome', row);
+  const mail: EmailOutcome = notify || !sent.sent ? sent : { sent: false, reason: 'You chose not to send an email.' };
   if (mail.sent) await db.from('restaurants').update({ welcome_email_sent_at: new Date().toISOString() }).eq('id', row.id);
 
+  await audit(admin.email, 'restaurant_created', { restaurantId: row.id, detail: `${plan} plan${paid ? ', paid' : ', unpaid'}` });
   revalidatePath('/');
-  return { created: { name, username, email, password, pin: row.staff_pin, status: row.status, expires: row.subscription_expires_at, mail } };
+  return { created: { name, username, email, setPasswordUrl, pin: row.staff_pin, status: row.status, expires: row.subscription_expires_at, mail } };
 }
 
 // ---------- access ----------
 export async function setPayment(id: string, paid: boolean) {
-  return guard(async () => {
+  return guard({ action: paid ? 'payment_paid' : 'payment_unpaid', id }, async () => {
     const r = await load(id);
     const db = supabaseAdmin();
     const { error } = await db.from('restaurants').update({ payment_status: paid ? 'paid' : 'unpaid' }).eq('id', r.id);
@@ -126,7 +142,7 @@ export async function setPayment(id: string, paid: boolean) {
 }
 
 export async function activate(id: string) {
-  return guard(async () => {
+  return guard({ action: 'activated', id }, async () => {
     const r = await load(id);
     const { error } = await supabaseAdmin().from('restaurants').update({ status: 'active' }).eq('id', r.id);
     if (error) return fail(error.message);
@@ -140,7 +156,7 @@ export async function activate(id: string) {
 }
 
 export async function suspend(id: string) {
-  return guard(async () => {
+  return guard({ action: 'suspended', id }, async () => {
     const r = await load(id);
     const { error } = await supabaseAdmin().from('restaurants').update({ status: 'suspended', suspension_reason: 'manual' }).eq('id', r.id);
     if (error) return fail(error.message);
@@ -149,7 +165,7 @@ export async function suspend(id: string) {
 }
 
 export async function extendPlan(id: string, plan: Plan) {
-  return guard(async () => {
+  return guard({ action: 'plan_extended', id, detail: String(plan) }, async () => {
     if (!isPlan(plan)) return fail('Choose a plan.');
     const r = await load(id);
     const { data, error } = await supabaseAdmin().rpc('extend_subscription', { p_restaurant_id: r.id, p_plan: plan });
@@ -161,7 +177,7 @@ export async function extendPlan(id: string, plan: Plan) {
 }
 
 export async function setRateLimit(id: string, max: number, daily: boolean) {
-  return guard(async () => {
+  return guard({ action: 'limit_changed', id, detail: `${max} per ${daily ? 'day' : 'hour'}` }, async () => {
     if (!Number.isInteger(max) || max < 1 || max > 10_000_000) return fail('Enter a whole number of requests.');
     const r = await load(id);
     const { error } = await supabaseAdmin().from('restaurants').update({ rate_limit_max: max, rate_limit_window: daily ? '1 day' : '1 hour' }).eq('id', r.id);
@@ -171,23 +187,23 @@ export async function setRateLimit(id: string, max: number, daily: boolean) {
 }
 
 // ---------- credentials ----------
+// The old password stops working at once; connected computers stay connected.
 export async function resetPassword(id: string) {
-  return guard(async () => {
+  return guard({ action: 'password_link_sent', id }, async () => {
     const r = await load(id);
     const uid = await authUserId(r.id);
     if (!uid) return fail(`${r.name} has no sign-in account.`);
-    const password = generatePassword();
-    const { error } = await supabaseAdmin().auth.admin.updateUserById(uid, { password });
+    const { error } = await supabaseAdmin().auth.admin.updateUserById(uid, { password: unknownPassword() });
     if (error) return fail(error.message);
-    const mail = await sendAccessEmail('password', r, { password });
-    return mail.sent
-      ? done(`New password emailed to ${r.email}.`)
-      : done(`Password reset, but the email was not sent (${mail.reason}). Share it securely:`, password);
+    const { mail, url } = await sendPasswordLink('password', r);
+    if (mail.sent) return done(`A link to set a new password was emailed to ${r.email}.`);
+    if (!url) return fail(mail.reason);
+    return done(`The password was reset, but the link was not emailed (${mail.reason}). Pass this link on securely; it works once:`, url);
   });
 }
 
 export async function regeneratePin(id: string) {
-  return guard(async () => {
+  return guard({ action: 'pin_changed', id }, async () => {
     const r = await load(id);
     const db = supabaseAdmin();
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -206,7 +222,7 @@ export async function regeneratePin(id: string) {
 // A Razorpay payment link for one period of the chosen plan. Razorpay emails it to the restaurant;
 // when it's paid, the webhook marks the restaurant paid and extends the plan.
 export async function sendPaymentLink(id: string, plan: Plan) {
-  return guard(async () => {
+  return guard({ action: 'payment_link_sent', id, detail: String(plan) }, async () => {
     if (!isPlan(plan)) return fail('Choose a plan.');
     const r = await load(id);
     const link = await createPaymentLink(r, plan);
@@ -216,7 +232,7 @@ export async function sendPaymentLink(id: string, plan: Plan) {
 }
 
 export async function runReminders() {
-  return guard(async () => {
+  return guard({ action: 'reminders_sent' }, async () => {
     const { sent, failed } = await sendDueReminders();
     if (!sent.length && !failed.length) return done('No reminders are due. Restaurants are emailed 7 days and 1 day before their plan ends.');
     if (failed.length && !sent.length) return fail(`No reminders could be sent: ${failed.join('; ')}`);
@@ -226,7 +242,7 @@ export async function runReminders() {
 
 // ---------- alerts ----------
 export async function dismissAlert(id: string) {
-  return guard(async () => {
+  return guard({ action: 'alert_dismissed' }, async () => {
     if (!UUID.test(id)) return fail('Unknown alert.');
     const db = supabaseAdmin();
     const { data, error } = await db.from('admin_alerts').update({ resolved_at: new Date().toISOString() }).eq('id', id).select('kind').single();

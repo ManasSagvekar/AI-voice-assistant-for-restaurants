@@ -113,10 +113,17 @@
 .sent-pop { animation: pop .45s cubic-bezier(.2,.9,.3,1.4); }
 @keyframes pop { from { transform: scale(.4); opacity: 0; } to { transform: none; opacity: 1; } }
 
-/* Kitchen tickets: printing shows only the ticket being printed, sized for an 80 mm receipt printer. */
+/* Kitchen tickets and bills: only the ticket prints, on one piece of paper, sized for an 80 mm receipt
+   printer. Everything else is removed rather than hidden, or it would still take up pages. */
 @media print {
-  body * { visibility: hidden; }
-  .print-ticket, .print-ticket * { visibility: visible; }
-  .print-ticket { position: absolute; left: 0; top: 0; width: 72mm; border-radius: 0; background: #fff; color: #000; }
-  .print-ticket .no-print { display: none; }
+  @page { margin: 0; }
+  html, body { background: #fff !important; height: auto; min-height: 0; }
+  body *:not(:has(.print-ticket)):not(.print-ticket):not(.print-ticket *) { display: none !important; }
+  body *:has(.print-ticket) {
+    position: static !important; display: block !important; height: auto !important; min-height: 0 !important; max-height: none !important; overflow: visible !important;
+    margin: 0 !important; padding: 0 !important; background: none !important; box-shadow: none !important; backdrop-filter: none !important; transform: none !important;
+  }
+  body *:has(.print-ticket)::before, body *:has(.print-ticket)::after, .glass-bg::before, .glass-bg::after { display: none !important; }
+  .print-ticket { width: 72mm; border-radius: 0; background: #fff; color: #000; box-shadow: none; overflow: visible; }
+  .print-ticket .no-print { display: none !important; }
 }

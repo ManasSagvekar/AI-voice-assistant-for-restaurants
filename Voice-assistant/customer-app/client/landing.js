@@ -59,24 +59,26 @@ document.addEventListener('keydown', (e) => {
 
 select(read() || 'guest');
 
-fetch('/api/config').then((r) => r.json()).then(({ tables, busy = [], restaurant, service }) => {
+fetch('/api/config').then((r) => r.json()).then(({ tables, busy = [], mine = [], held = [], restaurant, service }) => {
   document.getElementById('restaurant-name').textContent = restaurant;
   document.title = restaurant;
   if (!service.active) { document.getElementById('paused').hidden = false; return; }
   const box = document.getElementById('tables');
   for (const t of tables) {
-    const occupied = busy.includes(t);
+    // This device's own table always opens; one that is occupied or on another device doesn't.
+    const own = mine.includes(t);
+    const occupied = !own && (busy.includes(t) || held.includes(t));
     const choice = document.createElement(occupied ? 'button' : 'a');
     if (occupied) {
       choice.type = 'button';
       choice.disabled = true;
-      choice.title = 'This table is occupied';
-      choice.setAttribute('aria-label', `Table ${t.slice(1)} is occupied`);
+      choice.title = 'This table is in use';
+      choice.setAttribute('aria-label', `Table ${t.slice(1)} is in use`);
     } else {
       choice.href = '/table/' + t.slice(1);
     }
     choice.className = 'chip glass-chip' + (occupied ? ' opacity-50 cursor-not-allowed' : '');
-    choice.textContent = 'Table ' + t.slice(1) + (occupied ? ' · Occupied' : ' · Available');
+    choice.textContent = 'Table ' + t.slice(1) + (own ? ' · This device' : occupied ? ' · In use' : ' · Available');
     box.appendChild(choice);
   }
 });

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up a tablet</title>
+<meta name="robots" content="noindex">
+<style>
+  :root { color-scheme: light; }
+  body { margin: 0; background: #FAF8F5; color: #1A1A1A; font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 560px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  h2 { font-size: 18px; margin: 28px 0 6px; }
+  p, li { color: #4A443C; }
+  ol { padding-left: 22px; margin: 6px 0; }
+  li { margin: 4px 0; }
+  .btn { display: inline-block; background: #9E7330; color: #fff; text-decoration: none; font-weight: 600; padding: 12px 20px; border-radius: 999px; margin: 8px 8px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Set up this tablet</h1>
+  <p>The assistant needs the microphone, and browsers only allow that on a secure connection. Do this once on each tablet, so it trusts this restaurant's own computer.</p>
+
+  <h2>1. Download the certificate</h2>
+  <a class="btn" href="/tablet-ca.crt">Download certificate</a>
+
+  <h2>2. Install it</h2>
+  <p><strong>Android:</strong></p>
+  <ol>
+    <li>Open Settings and search for <strong>Install a certificate</strong> (or go to Security, then Encryption &amp; credentials).</li>
+    <li>Choose <strong>CA certificate</strong>, then <strong>Install anyway</strong>.</li>
+    <li>Pick the downloaded file, <strong>tablet-ca.crt</strong>.</li>
+  </ol>
+  <p><strong>iPad:</strong></p>
+  <ol>
+    <li>Open Settings, then <strong>Profile Downloaded</strong>, and install it.</li>
+    <li>Go to General, then About, then <strong>Certificate Trust Settings</strong>, and switch it on.</li>
+  </ol>
+
+  <h2>3. Open the restaurant</h2>
+  <p>Close and reopen the browser first. Then choose this tablet's table; it stays with this table until staff release it.</p>
+  <a class="btn" href="/">Continue to the tables</a>
+  <p>If you skip the certificate, the browser shows a warning you can click through, and it asks for the microphone again more often.</p>
+</main>
+</body>
+</html>

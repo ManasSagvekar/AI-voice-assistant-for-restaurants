@@ -1,5 +1,5 @@
-import { fmt, CATEGORIES, CURRENCIES, currency, menuCategories, catLabel, RATE_LIMIT, MAX_TURN_MS, ALLERGENS, ALLERGEN_KEYS, SAMPLE_EXTRACTION } from '../../shared/engine.js';
-import { parseMenu, parseMenuText, linesFromPdf } from '../../shared/menuparse.js';
+import { fmt, CATEGORIES, CURRENCIES, currency, hasSizes, menuCategories, catLabel, RATE_LIMIT, MAX_TURN_MS, ALLERGENS, ALLERGEN_KEYS, SAMPLE_EXTRACTION } from '../../shared/engine.js';
+import { parseMenu, parseMenuText, linesFromPdf, pageFromOcr } from '../../shared/menuparse.js';
 import {
   useState, useEffect, useRef, useCallback, tableName, mmss, ago, modsText, Icon, DietMark, DishImage, Switch, chime,
   Toasts, api, useLive, useToasts, Brand, LiveBadge, Loading, useContext, RestaurantContext, useRestaurant, ServicePaused, serviceChanged,
@@ -180,7 +180,10 @@ function Dashboard({ toast, onLogout, onExpired, service }) {
         case 'SET_TABLE_OCCUPIED': return await api(`/api/admin/tables/${a.table}/occupancy`, 'PATCH', { occupied: a.occupied });
         case 'SET_TABLE_COUNT': return await api('/api/admin/settings/table-count', 'PATCH', { count: a.count });
         case 'TABLET_SETTINGS': return await api('/api/admin/settings/tablets', 'PATCH', a.patch);
-        case 'BACKUP_NOW': return await api('/api/admin/backup', 'POST', {});
+        case 'RELEASE_TABLE': return await api(`/api/admin/tables/${a.table}/release`, 'POST', {});
+        case 'CREATE_BILL': return await api(`/api/admin/tables/${a.table}/bill`, 'POST', {});
+        case 'SET_BILLING': return await api('/api/admin/settings/billing', 'PATCH', a.body);
+        case 'HEALTH': return await api('/api/admin/health');
       }
     } catch (e) {
       if (e.status === 401) { toast('Your staff session ended. Please sign in again.', 'warn'); onExpired(); }
@@ -228,13 +231,13 @@ function tableTimes(state, t, now) {
   };
 }
 
-function TablesView({ state, now, dispatch, toast }) {
+function TablesView({ state, now, dispatch, toast, printBill }) {
   return (
     <div className="flex flex-col gap-4">
-      <div className="grid lg:grid-cols-3 gap-4 items-start">
+      <div className="grid lg:grid-cols-2 gap-4 items-start">
         <TableCountControl count={state.tables.length} dispatch={dispatch} toast={toast} />
         <TabletSettings settings={state.settings} dispatch={dispatch} toast={toast} />
-        <BackupCard backup={state.backup} now={now} dispatch={dispatch} toast={toast} />
+        <div className="lg:col-span-2"><BillingCard meta={state.meta} dispatch={dispatch} toast={toast} /></div>
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
         {state.tables.map((t) => {
@@ -261,10 +264,99 @@ function TablesView({ state, now, dispatch, toast }) {
                 if (result) toast(`${tableName(t)} marked ${occupied ? 'available' : 'occupied'}.`);
               }} />
             </div>
-            <a href={`/table/${t.slice(1)}`} target="_blank" rel="noopener" className="text-[13px] text-gold-dark hover:underline mt-1">Open this table's screen</a>
+            <div className="flex items-center justify-between gap-2 mt-1 text-[13px]">
+              {state.claims && state.claims[t]
+                ? <span className="text-muted">Tablet seen {ago(now - state.claims[t].lastSeen)}</span>
+                : <span className="text-muted">No tablet yet</span>}
+              {state.claims && state.claims[t] && (
+                <button className="text-muted hover:text-[#B5462E]" onClick={async () => {
+                  if (!window.confirm(`Release ${tableName(t)} from its tablet? The next device to open this table takes it over.`)) return;
+                  if (await dispatch({ type: 'RELEASE_TABLE', table: t })) toast(`${tableName(t)} released.`);
+                }}>Release</button>
+              )}
+            </div>
+            <div className="flex items-center justify-between gap-2 text-[13px]">
+              <a href={`/table/${t.slice(1)}`} target="_blank" rel="noopener" className="text-gold-dark hover:underline">Open this table's screen</a>
+              <button className="text-gold-dark hover:underline flex items-center gap-1" onClick={() => printBill(t)}><Icon name="printer" className="w-3.5 h-3.5" />Bill</button>
+            </div>
           </article>
         );
         })}
+      </div>
+    </div>
+  );
+}
+
+
+// Tax, service charge and what the printed bill says. Each order keeps the rates it was sent with.
+function BillingCard({ meta, dispatch, toast }) {
+  const saved = meta.billing;
+  const [form, setForm] = useState(saved);
+  useEffect(() => setForm(saved), [JSON.stringify(saved)]); // eslint-disable-line react-hooks/exhaustive-deps
+  const up = (patch) => setForm((f) => ({ ...f, ...patch }));
+  const field = 'w-full bg-sand rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-gold/50';
+  const save = async (e) => {
+    e.preventDefault();
+    const body = { ...form, taxRate: Number(form.taxRate) || 0, serviceRate: Number(form.serviceRate) || 0 };
+    if (await dispatch({ type: 'SET_BILLING', body })) toast('Saved. New orders use these rates; orders already sent keep theirs.');
+  };
+  return (
+    <form onSubmit={save} className="glass rounded-2xl p-4 flex flex-col gap-3">
+      <p className="label">Tax and bill</p>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <label className="block"><span className="text-[12px] text-muted block mb-1">Tax name</span><input value={form.taxLabel} maxLength={16} onChange={(e) => up({ taxLabel: e.target.value })} placeholder="VAT, GST…" className={field} /></label>
+        <label className="block"><span className="text-[12px] text-muted block mb-1">Tax rate %</span><input value={form.taxRate} inputMode="decimal" onChange={(e) => up({ taxRate: e.target.value.replace(/[^0-9.]/g, '') })} className={field} /></label>
+        <label className="block"><span className="text-[12px] text-muted block mb-1">Service charge %</span><input value={form.serviceRate} inputMode="decimal" onChange={(e) => up({ serviceRate: e.target.value.replace(/[^0-9.]/g, '') })} className={field} /></label>
+      </div>
+      <label className="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" className="w-4 h-4 accent-[#2E7D4F]" checked={form.taxIncluded} onChange={() => up({ taxIncluded: !form.taxIncluded })} />Menu prices already include this tax</label>
+      <div className="grid sm:grid-cols-2 gap-3">
+        <label className="block"><span className="text-[12px] text-muted block mb-1">Address on the bill</span><input value={form.address} maxLength={200} onChange={(e) => up({ address: e.target.value })} className={field} /></label>
+        <label className="block"><span className="text-[12px] text-muted block mb-1">Tax number (TRN, GSTIN…)</span><input value={form.taxId} maxLength={40} onChange={(e) => up({ taxId: e.target.value })} className={field} /></label>
+      </div>
+      <label className="block"><span className="text-[12px] text-muted block mb-1">Line at the bottom of the bill</span><input value={form.footer} maxLength={120} onChange={(e) => up({ footer: e.target.value })} placeholder="Thank you for dining with us" className={field} /></label>
+      <button className="btn-gold self-start py-2">Save</button>
+    </form>
+  );
+}
+
+// The printable bill, sized like a kitchen ticket for an 80 mm receipt printer.
+function BillDialog({ bill, onClose }) {
+  const row = (label, value, strong) => <div className={'flex justify-between gap-3 ' + (strong ? 'font-bold text-[16px] border-t border-dashed border-current pt-1.5 mt-1.5' : '')}><span className="min-w-0">{label}</span><span className="tabular-nums shrink-0 whitespace-nowrap">{value}</span></div>;
+  const b = bill.billing;
+  const rate = (n) => (b ? ` ${n}%` : '');
+  const taxLabel = bill.taxLabel || 'Tax';
+  return (
+    <div className="fixed inset-0 z-[60] bg-ink/40 flex items-center justify-center gutter overflow-y-auto" onClick={onClose}>
+      <div className="flex flex-col items-center gap-3 py-6" onClick={(e) => e.stopPropagation()} role="dialog" aria-label={`Bill ${bill.number}`}>
+        <article className="print-ticket bg-white text-[#111] w-[72mm] p-3 text-[13px] leading-snug shadow-2xl">
+          <p className="text-center font-bold text-[17px]">{bill.restaurant}</p>
+          {bill.address && <p className="text-center text-[12px]">{bill.address}</p>}
+          {bill.taxId && <p className="text-center text-[12px]">Tax no. {bill.taxId}</p>}
+          <div className="border-t border-dashed border-current mt-2 pt-2 flex justify-between gap-2 text-[12px]">
+            <span>Bill {bill.number}{bill.reprint ? ' (copy)' : ''} · {tableName(bill.table)}</span>
+            <span className="tabular-nums">{new Date(bill.at).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })}</span>
+          </div>
+          <ul className="border-t border-dashed border-current mt-2 pt-2 flex flex-col gap-1">
+            {bill.lines.map((l, i) => (
+              <li key={i}>
+                <div className="flex justify-between gap-3"><span className="min-w-0">{l.qty} × {l.name}</span><span className="tabular-nums shrink-0 whitespace-nowrap">{fmt(l.total)}</span></div>
+                {l.mods.length > 0 && <p className="text-[11px] pl-4">{modsText(l.mods)}</p>}
+              </li>
+            ))}
+          </ul>
+          <div className="border-t border-dashed border-current mt-2 pt-2">
+            {row('Subtotal', fmt(bill.subtotal))}
+            {bill.service > 0 && row(`Service charge${rate(b && b.serviceRate)}`, fmt(bill.service))}
+            {bill.tax > 0 && row(b && b.taxIncluded ? `Includes ${taxLabel}${rate(b.taxRate)}` : `${taxLabel}${rate(b && b.taxRate)}`, fmt(bill.tax))}
+            {row('Total', fmt(bill.total), true)}
+            {bill.split > 1 && row(`Split ${bill.split} ways, each`, fmt(Math.ceil((bill.total / bill.split) * 100) / 100))}
+          </div>
+          {bill.footer && <p className="text-center text-[12px] mt-3">{bill.footer}</p>}
+        </article>
+        <div className="flex gap-2 no-print">
+          <button className="btn-gold" onClick={() => window.print()}><Icon name="printer" className="w-4 h-4" />Print</button>
+          <button className="btn-outline" onClick={onClose}>Close</button>
+        </div>
       </div>
     </div>
   );
@@ -289,22 +381,6 @@ function TabletSettings({ settings, dispatch, toast }) {
         {seg(settings.voicePrivacy, [['standard', 'Standard'], ['offline', 'This computer only']], (v) => set({ voicePrivacy: v }, v === 'offline' ? 'No speech or reply text leaves this computer now.' : 'Tablets may use Google voices again.'))}
       </div>
       <p className="text-[12px] text-muted">"This computer only" turns off Google's online voices and the browser's speech recognition. Tablets then use the voice service on this computer, or touch and typing if it isn't running.</p>
-    </section>
-  );
-}
-
-function BackupCard({ backup, now, dispatch, toast }) {
-  const [busy, setBusy] = useState(false);
-  const run = async () => { setBusy(true); if (await dispatch({ type: 'BACKUP_NOW' })) toast('Backup saved.'); setBusy(false); };
-  const stale = !backup.at || now - backup.at > 30 * 3600e3;
-  return (
-    <section className="glass rounded-2xl p-4 flex flex-col gap-2">
-      <p className="label">Backups</p>
-      <p className={'text-sm ' + (backup.error || stale ? 'text-[#8A2E1C]' : 'text-ink')}>
-        {backup.error ? `Last backup failed: ${backup.error}` : backup.at ? `Last backup ${ago(now - backup.at)} (${new Date(backup.at).toLocaleString()})` : 'No backup yet'}
-      </p>
-      <p className="text-[12px] text-muted break-all">Saved nightly to {backup.dir}{backup.copyDir ? `, copied to ${backup.copyDir}` : ''}. The newest {backup.keep} are kept.</p>
-      <button onClick={run} disabled={busy} className="btn-outline py-1.5 self-start">{busy ? 'Backing up…' : 'Back up now'}</button>
     </section>
   );
 }
@@ -346,10 +422,16 @@ function TableCountControl({ count, dispatch, toast }) {
 function Admin({ state, dispatch, now, toast, activeOrders, openRequests }) {
   const { restaurant } = useContext(RestaurantContext);
   const [tab, setTab] = useState('orders');
+  const [bill, setBill] = useState(null);
+  const [health, setHealth] = useState(null);
+  const checkHealth = useCallback(async () => { const h = await dispatch({ type: 'HEALTH' }); if (h) setHealth(h); }, [dispatch]);
+  useEffect(() => { checkHealth(); const id = setInterval(checkHealth, 30000); return () => clearInterval(id); }, [checkHealth]);
+  const problems = health ? health.checks.filter((c) => c.status !== 'ok').length : null;
+  const printBill = async (table) => { const b = await dispatch({ type: 'CREATE_BILL', table }); if (b) setBill(b); };
   const offCount = state.menu.filter((m) => !m.available).length;
   const blocks = state.security.length;
   const busyTables = state.tables.filter((t) => state.occupancy?.[t]).length;
-  const tabs = [['orders', 'Live Orders', activeOrders], ['tables', 'Tables', null], ['menu', 'Menu Control', null], ['ingest', 'Import Menu', null], ['requests', 'Service Requests', openRequests], ['security', 'Security Log', blocks]];
+  const tabs = [['orders', 'Live Orders', activeOrders], ['tables', 'Tables', null], ['menu', 'Menu Control', null], ['ingest', 'Import Menu', null], ['requests', 'Service Requests', openRequests], ['security', 'Security Log', blocks], ['health', 'Health', problems]];
   const kpis = [
     ['Active orders', activeOrders, `${state.orders.filter((o) => o.status === 'kitchen').length} in the kitchen`],
     ['Open requests', openRequests, 'Server calls and bills'],
@@ -359,6 +441,13 @@ function Admin({ state, dispatch, now, toast, activeOrders, openRequests }) {
   ];
   return (
     <main className="gutter pb-16">
+      {state.meta && state.meta.billingSet === false && (
+        <div className="max-w-[1400px] mx-auto mb-3 rounded-xl bg-[#FFF4E5] border border-[#EBC88F] px-4 py-2.5 text-sm text-[#7A4B06] flex flex-wrap items-center justify-between gap-2">
+          <span>Bills show no tax until you set your rate.</span>
+          <button className="font-semibold underline" onClick={() => setTab('tables')}>Set it in Tables, Tax and bill</button>
+        </div>
+      )}
+      {bill && <BillDialog bill={bill} onClose={() => setBill(null)} />}
       <div className="max-w-[1400px] mx-auto">
         <section className="mt-3 flex flex-wrap items-end justify-between gap-3">
           <div>
@@ -386,10 +475,11 @@ function Admin({ state, dispatch, now, toast, activeOrders, openRequests }) {
         </div>
         <div className="mt-5">
           {tab === 'orders' && <OrderQueue orders={state.orders} dispatch={dispatch} now={now} undoMs={state.undoMs} />}
-          {tab === 'tables' && <TablesView state={state} now={now} dispatch={dispatch} toast={toast} />}
+          {tab === 'tables' && <TablesView state={state} now={now} dispatch={dispatch} toast={toast} printBill={printBill} />}
           {tab === 'menu' && <MenuControl menu={state.menu} photosPending={state.photosPending} dispatch={dispatch} toast={toast} />}
           {tab === 'ingest' && <Ingestor dispatch={dispatch} toast={toast} menu={state.menu} onDone={() => setTab('menu')} />}
-          {tab === 'requests' && <Requests requests={state.requests} allergenLog={state.allergenLog || []} dispatch={dispatch} now={now} />}
+          {tab === 'health' && <HealthView health={health} now={now} onCheck={checkHealth} />}
+          {tab === 'requests' && <Requests requests={state.requests} allergenLog={state.allergenLog || []} dispatch={dispatch} now={now} printBill={printBill} />}
           {tab === 'security' && <SecurityLog entries={state.security} now={now} />}
         </div>
       </div>
@@ -418,7 +508,7 @@ function OrderQueue({ orders, dispatch, now, undoMs = 60000 }) {
                     <span className="text-[11.5px] text-muted">{o.id} · {ago(now - o.createdAt)}</span>
                   </div>
                   <ul className="mt-2 text-[13px] flex flex-col gap-0.5">
-                    {o.lines.map((l) => <li key={l.itemId + l.mods.join()} className="flex justify-between gap-2"><span className="min-w-0">{l.qty} × {l.name}{l.mods.length ? <strong className="text-[#8A2E1C]"> · {modsText(l.mods)}</strong> : null}</span></li>)}
+                    {o.lines.map((l) => <li key={l.name + l.mods.join()} className="flex justify-between gap-2"><span className="min-w-0">{l.qty} × {l.name}{l.mods.length ? <strong className="text-[#8A2E1C]"> · {modsText(l.mods)}</strong> : null}</span></li>)}
                   </ul>
                   {o.note && <p className="mt-2 text-[12px] font-semibold bg-[#FFF4E5] text-[#7A4B06] rounded-lg px-2 py-1">{o.note}</p>}
                   {status === 'received' && now - o.createdAt < undoMs && <p className="mt-2 text-[11.5px] text-muted">The guest can still take this back for {mmss(undoMs - (now - o.createdAt))}</p>}
@@ -440,6 +530,7 @@ function OrderQueue({ orders, dispatch, now, undoMs = 60000 }) {
 function PriceInput({ item, dispatch, toast }) {
   const [v, setV] = useState(item.price.toFixed(2));
   useEffect(() => setV(item.price.toFixed(2)), [item.price]);
+  if (hasSizes(item)) return <span className="text-[13px] text-muted whitespace-nowrap" title="Change these in Details">{item.sizes.length} sizes, from {fmt(item.price)}</span>;
   const commit = () => {
     const n = Math.round(parseFloat(v) * 100) / 100;
     if (!isFinite(n) || n < 0.5 || n > 100000) { toast(`Enter a price between ${fmt(0.5)} and ${fmt(100000)}.`, 'danger'); setV(item.price.toFixed(2)); return; }
@@ -495,6 +586,7 @@ function DishDetails({ item, menu, dispatch, toast }) {
       </div>
       <div className="flex flex-col gap-3">
         <DishPhoto item={item} dispatch={dispatch} toast={toast} />
+        <DishSizes item={item} dispatch={dispatch} toast={toast} />
         <label className="block">
           <span className="label block mb-1">Suggest with this dish</span>
           <select value={item.pairWith || ''} onChange={(e) => set({ pairWith: e.target.value || null }, e.target.value ? 'The assistant will suggest it once per order.' : 'No pairing suggested.')} className="w-full bg-sand rounded-lg px-2 py-1.5 text-sm">
@@ -510,6 +602,53 @@ function DishDetails({ item, menu, dispatch, toast }) {
           </label>
         ))}
       </div>
+    </div>
+  );
+}
+
+// Rows of size name and price, for the menu editor and the menu import.
+function SizeRows({ sizes, onChange }) {
+  const sym = CURRENCIES[currency()].trim();
+  const set = (i, patch) => onChange(sizes.map((s, j) => (j === i ? { ...s, ...patch } : s)));
+  return (
+    <div className="flex flex-col gap-1.5">
+      {sizes.map((s, i) => (
+        <div key={i} className="flex items-center gap-1.5">
+          <input aria-label="Size name" value={s.label} maxLength={24} placeholder="Half" onChange={(e) => set(i, { label: e.target.value })} className="cell w-[110px] bg-sand rounded-lg px-2 py-1 text-sm" />
+          <span className="text-[12px] text-muted">{sym}</span>
+          <input aria-label={`Price of ${s.label || 'this size'}`} value={s.price} inputMode="decimal" onChange={(e) => set(i, { price: e.target.value.replace(/[^0-9.]/g, '') })} className="cell w-[72px] bg-sand rounded-lg px-2 py-1 text-sm tabular-nums" />
+          <button type="button" aria-label={`Remove ${s.label || 'this size'}`} onClick={() => onChange(sizes.filter((_, j) => j !== i))} className="text-muted hover:text-[#B5462E]"><Icon name="x" className="w-3.5 h-3.5" /></button>
+        </div>
+      ))}
+      {sizes.length < 6 && <button type="button" onClick={() => onChange([...sizes, { label: '', price: '' }])} className="text-[13px] text-gold-dark hover:underline self-start">Add a size</button>}
+    </div>
+  );
+}
+const sizesReady = (sizes) => sizes.length >= 2 && sizes.every((s) => s.label.trim() && Number(s.price) >= 0.5 && Number(s.price) <= 100000)
+  && new Set(sizes.map((s) => s.label.trim().toLowerCase())).size === sizes.length;
+const cleanSizes = (sizes) => sizes.map((s) => ({ label: s.label.trim(), price: Number(s.price) }));
+
+// Half and Full, Small and Large: a dish with sizes asks the guest which one.
+function DishSizes({ item, dispatch, toast }) {
+  const saved = item.sizes || [];
+  const [sizes, setSizes] = useState(saved);
+  useEffect(() => setSizes(item.sizes || []), [JSON.stringify(item.sizes || [])]); // eslint-disable-line react-hooks/exhaustive-deps
+  const dirty = JSON.stringify(cleanSizes(sizes)) !== JSON.stringify(cleanSizes(saved));
+  const save = async () => {
+    const body = sizes.length ? cleanSizes(sizes) : null;
+    if (await dispatch({ type: 'UPDATE_ITEM', id: item.id, patch: { sizes: body } })) toast(body ? `${item.name} now comes in ${body.length} sizes.` : `${item.name} now has one price.`);
+  };
+  return (
+    <div>
+      <span className="label block mb-1">Sizes</span>
+      {!sizes.length && <p className="text-[12px] text-muted mb-1">One price. Add sizes if this dish comes as Half and Full, Small and Large, and so on.</p>}
+      <SizeRows sizes={sizes.length ? sizes : []} onChange={setSizes} />
+      {dirty && (
+        <div className="flex items-center gap-2 mt-1.5">
+          <button type="button" disabled={sizes.length > 0 && !sizesReady(sizes)} onClick={save} className="btn-gold py-1 px-3 text-[13px] disabled:bg-[#CFC6B8]">Save sizes</button>
+          {sizes.length > 0 && !sizesReady(sizes) && <span className="text-[12px] text-muted">Needs at least 2, each with its own name and price.</span>}
+        </div>
+      )}
     </div>
   );
 }
@@ -598,7 +737,7 @@ function MenuControl({ menu, photosPending, dispatch, toast }) {
 
 // PDF.js is large, so it loads only when a PDF is dropped; its worker reads the file off the main thread.
 let pdfjs = null;
-async function readPdf(file) {
+async function readPdf(file, onProgress) {
   if (!pdfjs) {
     const url = '/assets/vendor/pdfjs/pdf.min.mjs';
     pdfjs = await import(url);
@@ -606,25 +745,77 @@ async function readPdf(file) {
   }
   const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false }).promise;
   const pages = [];
+  const scans = []; // pages with no text layer: scans, which are read like photos
   for (let n = 1; n <= Math.min(doc.numPages, 30); n++) {
     const page = await doc.getPage(n);
     const text = await page.getTextContent();
-    pages.push({
-      width: page.getViewport({ scale: 1 }).width,
-      items: text.items.filter((it) => 'str' in it).map((it) => ({ str: it.str, x: it.transform[4], y: it.transform[5], h: it.height || Math.abs(it.transform[3]), w: it.width })),
-    });
+    const items = text.items.filter((it) => 'str' in it && it.str.trim()).map((it) => ({ str: it.str, x: it.transform[4], y: it.transform[5], h: it.height || Math.abs(it.transform[3]), w: it.width }));
+    if (items.length >= 4) { pages.push({ width: page.getViewport({ scale: 1 }).width, items }); continue; }
+    const viewport = page.getViewport({ scale: Math.min(3, MAX_SIDE / Math.max(page.view[2], page.view[3])) });
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width; canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    scans.push(canvas);
   }
-  return pages;
+  if (scans.length) pages.push(...await readPictures(scans, onProgress));
+  return { pages, fromPicture: scans.length > 0 };
 }
 
-const NO_TEXT = "This file has no readable text, so it looks like a scan or a photo. Upload the menu as a PDF with selectable text (as most menu designers and online menus export it), or as a .txt list: one dish per line with its price, and each section's name on its own line.";
+// Photos and scans are read on this computer by Tesseract, from files served by this server: nothing
+// is uploaded. English only. It loads only when needed, because it is large.
+const MAX_SIDE = 3000;
+const MIN_SIDE = 1800;
+const loadScript = (src) => new Promise((resolve, reject) => {
+  const s = document.createElement('script');
+  s.src = src; s.onload = resolve; s.onerror = () => reject(new Error('Could not load ' + src));
+  document.head.appendChild(s);
+});
+// A photo as a grey canvas of a size the reader handles well, the right way up (from its EXIF data).
+async function photoCanvas(file) {
+  const bitmap = await createImageBitmap(file);
+  const side = Math.max(bitmap.width, bitmap.height);
+  const scale = side > MAX_SIDE ? MAX_SIDE / side : side < MIN_SIDE ? MIN_SIDE / side : 1;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bitmap.width * scale); canvas.height = Math.round(bitmap.height * scale);
+  const ctx = canvas.getContext('2d');
+  ctx.filter = 'grayscale(1)';
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return canvas;
+}
+async function readPictures(canvases, onProgress) {
+  if (!window.Tesseract) await loadScript('/assets/vendor/tesseract/tesseract.min.js');
+  let current = 0;
+  const say = (pct) => onProgress(`Reading ${canvases.length > 1 ? `page ${current + 1} of ${canvases.length}` : 'the picture'}: ${pct}%`);
+  say(0);
+  const worker = await window.Tesseract.createWorker('eng', 1, {
+    workerPath: '/assets/vendor/tesseract/worker.min.js', corePath: '/assets/vendor/tesseract', langPath: '/assets/vendor/tesseract',
+    workerBlobURL: false, cacheMethod: 'none', logger: (m) => { if (m.status === 'recognizing text') say(Math.round(m.progress * 100)); },
+  });
+  try {
+    const pages = [];
+    for (; current < canvases.length; current++) {
+      const canvas = canvases[current];
+      const { data } = await worker.recognize(canvas, { rotateAuto: true }, { blocks: true });
+      const lines = (data.blocks || []).flatMap((b) => b.paragraphs).flatMap((p) => p.lines);
+      pages.push(pageFromOcr(lines, canvas.width, canvas.height));
+    }
+    return pages;
+  } finally {
+    await worker.terminate();
+  }
+}
+const isPicture = (f) => /\.(png|jpe?g|webp|bmp|heic|heif)$/i.test(f.name) || /^image\//.test(f.type);
+
+const NO_DISHES = "No dishes with prices could be found in this file. For a photo: hold the camera straight above the menu in good light, with the whole page in view and in focus. Menus in other languages or very decorative lettering may not be readable. You can also type the menu as a .txt list: one dish per line with its price, and each section's name on its own line.";
+const HEIC = "This browser can't open iPhone HEIC photos. Save the photo as JPG (or set the camera to Most Compatible) and try again.";
 const symbol = (code) => CURRENCIES[code].trim();
 // The built-in sample dishes a new restaurant starts with; an imported menu replaces them by default.
 const isSampleMenu = (menu) => menu.length > 0 && menu.every((m) => !m.id.startsWith('dish-'));
 
 function Ingestor({ dispatch, toast, menu, onDone }) {
   const [file, setFile] = useState(null);
-  const [reading, setReading] = useState(false);
+  const [reading, setReading] = useState(''); // what is happening while a file is read
   const [found, setFound] = useState(null); // { title, sections }
   const [rows, setRows] = useState(null);
   const [cur, setCur] = useState(currency());
@@ -632,44 +823,62 @@ function Ingestor({ dispatch, toast, menu, onDone }) {
   const [photos, setPhotos] = useState(null); // 'web' | 'none', asked every time
   const [drag, setDrag] = useState(false);
   const [error, setError] = useState('');
+  const [checked, setChecked] = useState(false); // staff compared a picture's dishes with the menu
   const inputRef = useRef(null);
 
   const reset = () => { setRows(null); setFound(null); setFile(null); setError(''); setPhotos(null); setReplace(null); };
-  const show = (f, result) => {
-    if (!result.rows.length) { setError(NO_TEXT); setRows(null); return; }
-    setFound({ title: result.title, sections: result.sections });
+  const show = (f, result, fromPicture = false) => {
+    if (!result.rows.length) { setError(NO_DISHES); setRows(null); return; }
+    setFound({ title: result.title, sections: result.sections, fromPicture, hardToRead: result.hardToRead });
+    setChecked(false);
     setCur(result.currency && CURRENCIES[result.currency] ? result.currency : currency());
     setReplace(isSampleMenu(menu) ? true : null);
     setPhotos(null);
     setRows(result.rows.map((r) => ({ key: Math.random(), ...r })));
   };
-  const handle = async (f) => {
+  // One PDF or text file, or several photos of the pages of one menu.
+  const handle = async (list) => {
+    const files = [...(list || [])];
+    const f = files[0];
     if (!f) return;
+    const pictures = files.filter(isPicture);
     const isText = /\.(txt|csv|md)$/i.test(f.name) || /^text\//.test(f.type);
     const isPdf = /\.pdf$/i.test(f.name) || f.type === 'application/pdf';
-    if (/\.(png|jpe?g|webp|heic)$/i.test(f.name) || /^image\//.test(f.type)) { setFile(f); setRows(null); setError(NO_TEXT); return; }
-    if (!isText && !isPdf) { toast('Upload a PDF, or a .txt/.csv menu.', 'danger'); return; }
-    if (f.size > 20 * 1024 * 1024) { toast('That file is over 20 MB.', 'danger'); return; }
-    setFile(f); setRows(null); setError(''); setReading(true);
+    if (!pictures.length && !isText && !isPdf) { toast('Upload a PDF, a photo, or a .txt/.csv menu.', 'danger'); return; }
+    if (files.some((x) => x.size > 20 * 1024 * 1024)) { toast('That file is over 20 MB.', 'danger'); return; }
+    setFile(pictures.length > 1 ? { name: `${pictures.length} photos` } : f); setRows(null); setError(''); setReading('Reading the menu…');
     try {
-      show(f, isText ? parseMenuText(await f.text()) : parseMenu(linesFromPdf(await readPdf(f))));
+      if (pictures.length) {
+        if (pictures.some((x) => /\.hei[cf]$/i.test(x.name))) { setError(HEIC); return; }
+        if (pictures.length > 10) { setError('Please choose up to 10 photos at a time.'); return; }
+        const canvases = [];
+        for (const p of pictures) canvases.push(await photoCanvas(p));
+        show(f, parseMenu(linesFromPdf(await readPictures(canvases, setReading))), true);
+      } else if (isText) {
+        show(f, parseMenuText(await f.text()));
+      } else {
+        const { pages, fromPicture } = await readPdf(f, setReading);
+        show(f, parseMenu(linesFromPdf(pages)), fromPicture);
+      }
     } catch (e) {
       console.error(e);
-      setError("This PDF couldn't be read. If it's password-protected, save an unprotected copy and try again.");
+      setError(pictures.length ? "This picture couldn't be read. Please try a JPG or PNG." : "This PDF couldn't be read. If it's password-protected, save an unprotected copy and try again.");
+    } finally {
+      setReading('');
     }
-    setReading(false);
   };
   const upd = (key, patch) => setRows((rs) => rs.map((r) => (r.key === key ? { ...r, ...patch } : r)));
   const renameSection = (id, label) => setFound((f) => ({ ...f, sections: f.sections.map((s) => (s.id === id ? { ...s, label } : s)) }));
   const onMenu = (r) => !replace && menu.some((m) => m.name.toLowerCase() === r.name.trim().toLowerCase());
-  const invalid = (r) => !r.name.trim() || !(r.price >= 0.5 && r.price <= 100000) || onMenu(r);
+  const invalid = (r) => !r.name.trim() || (r.sizes ? !sizesReady(r.sizes) : !(r.price >= 0.5 && r.price <= 100000)) || onMenu(r);
   const used = found ? found.sections.filter((s) => rows && rows.some((r) => r.category === s.id)) : [];
   const categoryOptions = [...used, ...CATEGORIES.filter((c) => !['all', 'specials'].includes(c.id))];
   const [publishing, setPublishing] = useState(false);
-  const blocked = publishing || !rows || !rows.length || rows.some(invalid) || rows.some((r) => !r.meals.length) || replace === null || !photos || used.some((s) => !s.label.trim());
+  const undecided = rows ? rows.filter((r) => r.priceRange && !r.rangeDone).length : 0;
+  const blocked = publishing || !rows || !rows.length || undecided > 0 || (found && found.fromPicture && !checked) || rows.some(invalid) || rows.some((r) => !r.meals.length) || replace === null || !photos || used.some((s) => !s.label.trim());
   const publish = async () => {
     const items = rows.map((r) => ({
-      name: r.name.trim(), desc: r.desc, category: r.category, price: Math.round(r.price * 100) / 100, aliases: r.aliases || [],
+      name: r.name.trim(), desc: r.desc, category: r.category, price: Math.round(r.price * 100) / 100, aliases: r.aliases || [], ...(r.sizes ? { sizes: cleanSizes(r.sizes) } : {}),
       diet: r.diet, vegan: r.vegan, gf: r.gf, spicy: r.spicy, meals: r.meals, allergens: r.allergens,
     }));
     setPublishing(true);
@@ -684,20 +893,20 @@ function Ingestor({ dispatch, toast, menu, onDone }) {
   return (
     <div className="grid lg:grid-cols-[320px_minmax(0,1fr)] gap-5 items-start">
       <div className="flex flex-col gap-4">
-        <div onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)} onDrop={(e) => { e.preventDefault(); setDrag(false); handle(e.dataTransfer.files[0]); }}
+        <div onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)} onDrop={(e) => { e.preventDefault(); setDrag(false); handle(e.dataTransfer.files); }}
           onClick={() => inputRef.current && inputRef.current.click()} role="button" tabIndex={0} onKeyDown={(e) => e.key === 'Enter' && inputRef.current.click()}
           className={'rounded-2xl border-2 border-dashed p-6 text-center cursor-pointer transition ' + (drag ? 'border-gold bg-gold-wash' : 'border-line bg-white hover:border-gold')}>
           <div className="mx-auto w-12 h-12 rounded-full bg-gold-wash text-gold-dark flex items-center justify-center"><Icon name="upload" className="w-6 h-6" /></div>
           <p className="font-serif text-lg mt-3">Drop your menu here</p>
-          <p className="text-[12.5px] text-muted mt-1">A PDF menu, or a .txt/.csv price list, up to 20 MB</p>
-          <input ref={inputRef} id="menu-file" type="file" accept=".pdf,.txt,.csv,.md,application/pdf,text/plain" className="hidden" onChange={(e) => { handle(e.target.files[0]); e.target.value = ''; }} />
+          <p className="text-[12.5px] text-muted mt-1">A PDF, photos of the menu's pages, or a .txt/.csv price list, up to 20 MB each</p>
+          <input ref={inputRef} id="menu-file" type="file" multiple accept=".pdf,.txt,.csv,.md,.png,.jpg,.jpeg,.webp,.heic,application/pdf,text/plain,image/*" className="hidden" onChange={(e) => { handle(e.target.files); e.target.value = ''; }} />
         </div>
         <button onClick={() => { setFile({ name: 'Sample menu' }); setError(''); show(null, { title: null, currency: null, sections: [], rows: SAMPLE_EXTRACTION }); }} className="btn-outline justify-center">Try a sample menu</button>
-        <p className="text-[11.5px] text-muted leading-relaxed">The menu is read on this computer. Its sections become the tablet's categories, in the menu's order; prices keep the menu's currency. Diet tags, spice and allergens are suggestions to check. Scanned menus and photos can't be read yet.</p>
+        <p className="text-[11.5px] text-muted leading-relaxed">The menu is read on this computer. Its sections become the tablet's categories, in the menu's order; prices keep the menu's currency. Diet tags, spice and allergens are suggestions to check. Photos and scans are read in English, and need checking against the menu.</p>
         {file && (reading || error) && (
           <div className="glass rounded-2xl p-4" role={error ? 'alert' : 'status'}>
             <p className="label mb-2">{file.name}</p>
-            {reading ? <p className="text-sm flex items-center gap-2"><span className="w-4 h-4 rounded-full border-2 border-gold border-t-transparent animate-spin" />Reading the menu…</p>
+            {reading ? <p className="text-sm flex items-center gap-2"><span className="w-4 h-4 rounded-full border-2 border-gold border-t-transparent animate-spin" />{reading}</p>
               : <p className="text-sm text-[#8A2E1C]">{error}</p>}
           </div>
         )}
@@ -707,6 +916,7 @@ function Ingestor({ dispatch, toast, menu, onDone }) {
         {!rows ? (
           <div className="glass rounded-2xl p-8 text-center">
             <p className="font-serif text-xl">{reading ? 'Reading your menu…' : 'Dishes from your menu will appear here'}</p>
+            {reading && <p className="text-sm text-muted mt-1">A photo can take a minute. This all happens on this computer.</p>}
             <p className="text-sm text-muted mt-1 max-w-md mx-auto">Sections, dish names, descriptions and prices are pulled into an editable table for you to check before publishing.</p>
           </div>
         ) : (
@@ -715,6 +925,14 @@ function Ingestor({ dispatch, toast, menu, onDone }) {
               <div>
                 <p className="font-serif text-xl">{rows.length} dishes{used.length ? ` in ${used.length} section${used.length === 1 ? '' : 's'}` : ''}{found.title ? ` · ${found.title}` : ''}</p>
                 <p className="text-[12.5px] text-muted">Check each row, answer the questions below, then publish. Highlighted rows need a look.</p>
+                {found.fromPicture && found.hardToRead && <p className="text-sm font-semibold text-[#8A2E1C] mt-1">This picture was hard to read, so many dishes may be wrong. A sharper photo will save you time: hold the camera straight above the menu, in good light.</p>}
+                {found.fromPicture && (
+                  <label className="flex items-start gap-2 text-[13px] text-[#7A4B06] mt-1.5 cursor-pointer">
+                    <input type="checkbox" className="mt-0.5 w-4 h-4 accent-[#2E7D4F]" checked={checked} onChange={() => setChecked(!checked)} />
+                    <span><strong>I've checked every name and price against the menu.</strong> This was read from a picture, and a misread price would be charged to guests.</span>
+                  </label>
+                )}
+                {undecided > 0 && <p className="text-[12.5px] font-semibold text-[#7A4B06] mt-1">{undecided} price {undecided === 1 ? 'range needs' : 'ranges need'} a decision before you can publish.</p>}
               </div>
               <div className="flex gap-2">
                 <button onClick={reset} className="btn-outline py-2">Discard</button>
@@ -775,9 +993,16 @@ function Ingestor({ dispatch, toast, menu, onDone }) {
                         <input aria-label="Dish name" value={r.name} onChange={(e) => upd(r.key, { name: e.target.value })} className="cell font-medium" />
                         <textarea aria-label="Description" value={r.desc} rows={2} placeholder="No description on the menu" onChange={(e) => upd(r.key, { desc: e.target.value })} className="cell text-[12.5px] text-muted mt-1 resize-none" />
                         {(r.priceNote || r.lowConf) && <p className="text-[11.5px] text-[#7A4B06] mt-1">{r.priceNote || r.lowConf}</p>}
+                        {r.priceRange && !r.rangeDone && (
+                          <div className="flex gap-2 mt-1.5">
+                            <button type="button" className="btn-outline py-1 px-2.5 text-[12px]" onClick={() => upd(r.key, { rangeDone: true, priceNote: '', sizes: [{ label: 'Half', price: r.priceRange[0] }, { label: 'Full', price: r.priceRange[1] }] })}>These are sizes</button>
+                            <button type="button" className="btn-outline py-1 px-2.5 text-[12px]" onClick={() => upd(r.key, { rangeDone: true, priceNote: '' })}>One price</button>
+                          </div>
+                        )}
+                        {r.sizes && <div className="mt-1.5"><SizeRows sizes={r.sizes} onChange={(sizes) => upd(r.key, sizes.length ? { sizes, priceNote: '' } : { sizes: null, priceNote: '' })} /></div>}
                         {onMenu(r) && <p className="text-[11.5px] text-[#B5462E] mt-1">Already on the menu</p>}
                       </td>
-                      <td className="px-2 py-2.5"><div className="flex items-center bg-sand rounded-lg pl-2 w-[104px]"><span className="text-muted text-[12px]">{symbol(cur)}</span><input aria-label="Price" value={r.price} inputMode="decimal" onChange={(e) => upd(r.key, { price: parseFloat(e.target.value.replace(/[^0-9.]/g, '')) || 0, priceNote: '' })} className="w-full bg-transparent px-1 py-1.5 tabular-nums focus:outline-none" /></div></td>
+                      <td className="px-2 py-2.5">{r.sizes ? <span className="text-[12px] text-muted whitespace-nowrap">By size</span> : <div className="flex items-center bg-sand rounded-lg pl-2 w-[104px]"><span className="text-muted text-[12px]">{symbol(cur)}</span><input aria-label="Price" value={r.price} inputMode="decimal" onChange={(e) => upd(r.key, { price: parseFloat(e.target.value.replace(/[^0-9.]/g, '')) || 0, ...(r.priceRange ? {} : { priceNote: '' }) })} className="w-full bg-transparent px-1 py-1.5 tabular-nums focus:outline-none" /></div>}</td>
                       <td className="px-2 py-2.5"><select aria-label="Section" value={r.category} onChange={(e) => upd(r.key, { category: e.target.value })} className="bg-sand rounded-lg px-2 py-1.5 max-w-[190px]">{categoryOptions.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}</select></td>
                       <td className="px-2 py-2.5">
                         <div className="flex flex-wrap gap-1 w-[180px]">
@@ -829,7 +1054,7 @@ function AllergyLog({ entries, now }) {
   );
 }
 
-function Requests({ requests, allergenLog, dispatch, now }) {
+function Requests({ requests, allergenLog, dispatch, now, printBill }) {
   if (!requests.length) return <><p className="text-muted text-sm">No service requests yet. Calls from tables appear here instantly.</p><AllergyLog entries={allergenLog} now={now} /></>;
   return (
     <>
@@ -842,7 +1067,8 @@ function Requests({ requests, allergenLog, dispatch, now }) {
           </div>
           <p className="font-serif text-lg">{r.type === 'bill' ? 'Bill requested' : 'Server called'}</p>
           <p className="text-[13px] text-muted">{r.detail}</p>
-          <div className="flex gap-2 mt-1">
+          <div className="flex flex-wrap gap-2 mt-1">
+            {r.type === 'bill' && <button onClick={() => printBill(r.table)} className="btn-outline py-1.5 px-3 text-[13px]"><Icon name="printer" className="w-3.5 h-3.5" />Print bill</button>}
             {r.status === 'open' && <button onClick={() => dispatch({ type: 'REQUEST_STATUS', id: r.id, status: 'acknowledged' })} className="btn-gold py-1.5 px-3 text-[13px]">Acknowledge</button>}
             {r.status !== 'done' && <button onClick={() => dispatch({ type: 'REQUEST_STATUS', id: r.id, status: 'done' })} className="btn-outline py-1.5 px-3 text-[13px]">{r.type === 'bill' ? 'Mark paid' : 'Mark done'}</button>}
           </div>
@@ -851,6 +1077,34 @@ function Requests({ requests, allergenLog, dispatch, now }) {
     </div>
     <AllergyLog entries={allergenLog} now={now} />
     </>
+  );
+}
+
+// Whether the licence is working, with what to do when it isn't.
+const HEALTH_LOOK = { ok: ['bg-[#2E7D4F]', 'Working'], warn: ['bg-[#E8A84C]', 'Needs a look'], down: ['bg-[#B5462E]', 'Not working'] };
+function HealthView({ health, now, onCheck }) {
+  if (!health) return <Loading label="Checking the system…" />;
+  const worst = health.checks.filter((c) => c.status === 'down').length;
+  const look = health.checks.filter((c) => c.status === 'warn').length;
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="font-serif text-xl">{worst ? `${worst} ${worst === 1 ? 'thing isn\u2019t' : 'things aren\u2019t'} working` : look ? `${look} ${look === 1 ? 'thing needs' : 'things need'} a look` : 'Everything is working'}</p>
+        <span className="flex items-center gap-3 text-[13px] text-muted">Checked {ago(now - health.at)}<button className="btn-outline py-1.5 px-3 text-[13px]" onClick={onCheck}>Check now</button></span>
+      </div>
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {health.checks.map((c) => (
+          <article key={c.id} className="glass rounded-2xl p-4 flex flex-col gap-1">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-semibold">{c.label}</span>
+              <span className="flex items-center gap-1.5 text-[12px] text-muted"><span className={'w-2.5 h-2.5 rounded-full ' + HEALTH_LOOK[c.status][0]} />{HEALTH_LOOK[c.status][1]}</span>
+            </div>
+            <p className="text-sm text-ink break-words">{c.detail}</p>
+            {c.fix && <p className="text-[13px] text-[#7A4B06] mt-1">{c.fix}</p>}
+          </article>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -934,7 +1188,7 @@ function KitchenScreen({ state, dispatch, now, online, sound, setSound }) {
               </div>
               <ul className="px-4 py-3 flex flex-col gap-1.5 text-[19px] leading-snug">
                 {o.lines.map((l) => (
-                  <li key={l.itemId + l.mods.join()}><span className="font-bold tabular-nums">{l.qty} ×</span> {l.name}{l.mods.length > 0 && <strong className="block text-[16px] text-[#8A2E1C] uppercase tracking-wide">{modsText(l.mods)}</strong>}</li>
+                  <li key={l.name + l.mods.join()}><span className="font-bold tabular-nums">{l.qty} ×</span> {l.name}{l.mods.length > 0 && <strong className="block text-[16px] text-[#8A2E1C] uppercase tracking-wide">{modsText(l.mods)}</strong>}</li>
                 ))}
               </ul>
               {o.note && <p className="mx-4 mb-3 rounded-lg bg-[#FFE7B8] text-[#5A3604] px-3 py-2 text-[16px] font-bold">{o.note}</p>}

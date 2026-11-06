@@ -6,17 +6,18 @@
 // from allergen lists the kitchen has confirmed; anything else fetches a member of staff.
 import {
   RATE_LIMIT, RATE_WINDOW, EMPTY_FILTERS, MODIFIERS, UNDO_MS, fmt, totals, priceLine, matchesFilters, describeFilters,
-  guardrail, sanitizeTranscript, parseIntent, validateCall, confirmWord, findItems, norm, upsellFor, allergenLabel,
+  guardrail, sanitizeTranscript, parseIntent, validateCall, confirmWord, findItems, norm, upsellFor, allergenLabel, hasSizes, sizeIn, withSize, cheapestSize,
 } from '../shared/engine.js';
 import { reply, dishName, allergenName } from '../shared/i18n.js';
 
 const joinWords = (a, and = 'and') => (a.length < 2 ? a.join('') : a.slice(0, -1).join(', ') + ` ${and} ` + a[a.length - 1]);
 const AND = { en: 'and', hi: 'और', mr: 'आणि' };
+const OR = { en: 'or', hi: 'या', mr: 'किंवा' };
 const PENDING_MS = 2 * 60e3;
 
 export function createAssistant(store) {
   const stamps = new Map(); // table -> command timestamps (per table session)
-  const pending = new Map(); // table -> { type: 'confirm' | 'upsell', itemId?, cartKey, at }
+  const pending = new Map(); // table -> { type: 'confirm' | 'upsell' | 'size', itemId?, queue?, cartKey, at }
   const offered = new Set(); // tables already offered a pairing for the current order
 
   function usage(table) {
@@ -30,13 +31,28 @@ export function createAssistant(store) {
   // Called when this computer switches restaurant.
   const reset = () => { stamps.clear(); pending.clear(); offered.clear(); };
 
-  const cartKey = (table) => JSON.stringify(store.cart(table).map((l) => [l.itemId, l.qty, l.mods]));
+  const cartKey = (table) => JSON.stringify(store.cart(table).map((l) => [l.itemId, l.qty, l.mods, l.size]));
+
+  // A dish that comes in sizes waits for the guest to pick one; several wait their turn.
+  function askSize(table, menu, lang, queue) {
+    const next = queue[0];
+    const item = menu.find((m) => m.id === next.itemId);
+    pending.set(table, { type: 'size', queue, cartKey: cartKey(table), at: Date.now() });
+    return reply(lang, 'askSize', { name: dishName(item, lang), options: joinWords(item.sizes.map((s) => `${s.label} (${fmt(s.price)})`), OR[lang]) });
+  }
+  function addSized(table, menu, lang, line, size, effects) {
+    const item = menu.find((m) => m.id === line.itemId);
+    store.addToCart(table, item.id, line.qty, line.mods, size.id);
+    effects.openCart = true;
+    const price = priceLine(menu, { itemId: item.id, qty: line.qty, mods: line.mods, size: size.id }).total;
+    return reply(lang, 'added', { qty: line.qty, name: withSize(dishName(item, lang), item, size.id), mods: line.mods.length ? joinWords(line.mods.map((k) => MODIFIERS[k].label.toLowerCase())) : '', price: fmt(price) });
+  }
 
   function readBack(table, menu, lang) {
     const cart = store.cart(table).filter((l) => (menu.find((m) => m.id === l.itemId) || {}).available);
     const list = joinWords(cart.map((l) => {
       const item = menu.find((m) => m.id === l.itemId);
-      return `${l.qty} × ${dishName(item, lang)}${l.mods.length ? ` (${l.mods.map((k) => MODIFIERS[k].label.toLowerCase()).join(', ')})` : ''}`;
+      return `${l.qty} × ${withSize(dishName(item, lang), item, l.size)}${l.mods.length ? ` (${l.mods.map((k) => MODIFIERS[k].label.toLowerCase()).join(', ')})` : ''}`;
     }), AND[lang]);
     pending.set(table, { type: 'confirm', cartKey: cartKey(table), at: Date.now() });
     return reply(lang, 'readBack', { list, total: fmt(totals(menu, cart).total) });
@@ -50,7 +66,9 @@ export function createAssistant(store) {
     if (up) {
       offered.add(table);
       pending.set(table, { type: 'upsell', itemId: up.item.id, cartKey: cartKey(table), at: Date.now() });
-      return reply(lang, 'upsell', { name: dishName(up.item, lang), price: fmt(up.item.price), base: dishName(up.base, lang) });
+      // A suggested dish that comes in sizes is offered in its smallest.
+      const small = cheapestSize(up.item);
+      return reply(lang, 'upsell', { name: withSize(dishName(up.item, lang), up.item, small && small.id), price: fmt(up.item.price), base: dishName(up.base, lang) });
     }
     return readBack(table, menu, lang);
   }
@@ -68,15 +86,28 @@ export function createAssistant(store) {
     const p = pending.get(table);
     if (!p || Date.now() - p.at > PENDING_MS || p.cartKey !== cartKey(table)) { pending.delete(table); return null; }
     const word = confirmWord(text);
+    if (p.type === 'size') {
+      const [line, ...rest] = p.queue;
+      const item = menu.find((m) => m.id === line.itemId);
+      const size = item && sizeIn(item, text);
+      if (!size) {
+        pending.delete(table);
+        return word === 'no' ? reply(lang, 'notAdded', { name: item ? dishName(item, lang) : '' }) : null; // anything else is a new request
+      }
+      const added = addSized(table, menu, lang, line, size, effects);
+      if (!rest.length) { pending.delete(table); return added; }
+      return added + ' ' + askSize(table, menu, lang, rest);
+    }
     if (!word || findItems(norm(text), menu).length) return null;
     if (p.type === 'upsell') {
       effects.openConfirm = true;
       if (word === 'no') return readBack(table, menu, lang);
       const item = menu.find((m) => m.id === p.itemId);
       if (!item || !item.available) return readBack(table, menu, lang);
-      store.addToCart(table, item.id, 1, []);
+      const small = cheapestSize(item);
+      store.addToCart(table, item.id, 1, [], small ? small.id : null);
       effects.upsellAdded = item.id;
-      return reply(lang, 'upsellAdded', { name: dishName(item, lang) }) + ' ' + readBack(table, menu, lang);
+      return reply(lang, 'upsellAdded', { name: withSize(dishName(item, lang), item, small && small.id) }) + ' ' + readBack(table, menu, lang);
     }
     pending.delete(table);
     if (word === 'no') { effects.closeConfirm = true; return reply(lang, 'notSent'); }
@@ -107,6 +138,7 @@ export function createAssistant(store) {
 
     const inspected = [];
     const out = [];
+    const needSize = []; // dishes in this request that still need a size
     const calls = parseIntent(text, menu);
     const allergyNote = calls.find((c) => c.tool === 'set_instructions' && /^Allergy:/.test(c.args.text));
     for (const call of calls) {
@@ -142,11 +174,12 @@ export function createAssistant(store) {
             out.push(reply(lang, 'unavailable', { name: dishName(item, lang), alt: alt && dishName(alt, lang) }));
             break;
           }
-          store.addToCart(table, item.id, a.qty, a.modifiers);
+          if (hasSizes(item) && !a.size) { needSize.push({ itemId: item.id, qty: a.qty, mods: a.modifiers }); break; }
+          store.addToCart(table, item.id, a.qty, a.modifiers, a.size || null);
           effects.openCart = true;
-          const lineTotal = priceLine(menu, { itemId: item.id, qty: a.qty, mods: a.modifiers }).total;
+          const lineTotal = priceLine(menu, { itemId: item.id, qty: a.qty, mods: a.modifiers, size: a.size }).total;
           const skipped = v.stripped.filter((s) => s.notAllowed).map((s) => s.value.toLowerCase());
-          out.push(reply(lang, 'added', { qty: a.qty, name: dishName(item, lang), mods: a.modifiers.length ? joinWords(a.modifiers.map((k) => MODIFIERS[k].label.toLowerCase())) : '', price: fmt(lineTotal) }));
+          out.push(reply(lang, 'added', { qty: a.qty, name: withSize(dishName(item, lang), item, a.size), mods: a.modifiers.length ? joinWords(a.modifiers.map((k) => MODIFIERS[k].label.toLowerCase())) : '', price: fmt(lineTotal) }));
           if (skipped.length) out.push(reply(lang, 'notForDish', { what: joinWords(skipped) }));
           if (v.stripped.some((s) => s.money)) out.push(reply(lang, 'menuPrice', { price: fmt(item.price) }));
           break;
@@ -159,7 +192,7 @@ export function createAssistant(store) {
         case 'describe_item': {
           const i = menu.find((m) => m.id === a.item_id);
           out.push(reply(lang, 'describe', {
-            name: dishName(i, lang), desc: i.desc, price: fmt(i.price), spicy: i.spicy, available: i.available, checked: !!i.allergensChecked,
+            name: dishName(i, lang), desc: i.desc, price: hasSizes(i) ? joinWords(i.sizes.map((s) => `${s.label} ${fmt(s.price)}`), AND[lang]) : fmt(i.price), spicy: i.spicy, available: i.available, checked: !!i.allergensChecked,
             allergens: joinWords(i.allergens.map((k) => allergenName(lang, k, allergenLabel(k))), AND[lang]),
           }));
           break;
@@ -224,6 +257,7 @@ export function createAssistant(store) {
           out.push(reply(lang, 'fallback'));
       }
     }
+    if (needSize.length) out.push(askSize(table, menu, lang, needSize));
     return { status: 200, body: { text: out.join(' '), heard: text, truncated, inspected: inspected[0] && inspected[0].tool === 'fallback' ? [] : inspected, effects, usage: usage(table) } };
   }
 

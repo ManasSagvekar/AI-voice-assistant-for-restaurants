@@ -5,24 +5,24 @@ import { planLabel, type Restaurant } from './types';
 
 type Kind = 'welcome' | 'password' | 'pin' | 'reminder';
 export type EmailOutcome = { sent: true } | { sent: false; reason: string };
-type EmailExtras = { password?: string; daysLeft?: number; payUrl?: string };
+type EmailExtras = { setPasswordUrl?: string; daysLeft?: number; payUrl?: string };
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const date = (iso: string | null) => (iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : null);
 
-function compose(kind: Kind, r: Restaurant, { password, daysLeft, payUrl }: EmailExtras) {
+function compose(kind: Kind, r: Restaurant, { setPasswordUrl, daysLeft, payUrl }: EmailExtras) {
   const until = date(r.subscription_expires_at);
   const live = r.status === 'active';
   const days = daysLeft === 1 ? 'tomorrow' : `in ${daysLeft} days`;
   const subject = {
     welcome: `${r.name}: your voice assistant access`,
-    password: `${r.name}: your new password`,
+    password: `${r.name}: set your password`,
     pin: `${r.name}: your new staff PIN`,
     reminder: `${r.name}: your plan ends ${days}`,
   }[kind];
   const intro = {
     welcome: 'Your restaurant has been approved for the table voice assistant. Here are your sign-in details.',
-    password: 'Your restaurant password has been reset. Use the new one below the next time you connect a computer.',
+    password: 'Please choose a new password for your restaurant account, using the button below. Your old one no longer works. Computers already connected stay connected.',
     pin: 'Your staff PIN has changed. The old PIN no longer works.',
     reminder: `Your ${planLabel(r.subscription_plan)} plan ends on ${until}. Renew before then so your tablets and staff dashboard keep working without a break.`,
   }[kind];
@@ -38,20 +38,20 @@ function compose(kind: Kind, r: Restaurant, { password, daysLeft, payUrl }: Emai
     : [
       ['Restaurant', r.name],
       ['Username', r.username],
-      ...(password ? [['Password', password] as [string, string]] : []),
       ['Staff PIN', r.staff_pin],
     ];
   const url = process.env.VOICE_ASSISTANT_URL;
   const steps = [
+    'Choose your password with the button in this email.',
     `Open the restaurant dashboard${url ? ` at ${url}` : ''}.`,
-    'The first time, choose Connect and sign in with your username and password.',
+    'The first time, choose Connect and sign in with your username and that password.',
     'After that, staff sign in with the 6-digit staff PIN.',
   ];
   const footer = kind === 'reminder' ? '' : 'Keep these details private. Anyone with the staff PIN can open your dashboard.';
   const text = [
     `Hello ${r.name},`, '', intro, '',
     ...rows.map(([k, v]) => `${k}: ${v}`), '',
-    status, ...(payUrl ? ['', `Pay now: ${payUrl}`] : []), '',
+    status, ...(setPasswordUrl ? ['', `Set your password (this link works once and expires soon; ask us for a new one if it has): ${setPasswordUrl}`] : []), ...(payUrl ? ['', `Pay now: ${payUrl}`] : []), '',
     ...(kind === 'welcome' ? ['Getting started:', ...steps.map((s, i) => `${i + 1}. ${s}`), ''] : []),
     footer,
   ].join('\n');
@@ -63,6 +63,7 @@ function compose(kind: Kind, r: Restaurant, { password, daysLeft, payUrl }: Emai
     ${rows.map(([k, v]) => `<tr><td style="padding:10px 14px;color:#6b665e;font-size:13px;width:40%">${esc(k)}</td><td style="padding:10px 14px;font-family:Consolas,monospace;font-size:15px">${esc(v)}</td></tr>`).join('')}
   </table>
   <p style="font-size:15px;line-height:1.5"><strong>${esc(status)}</strong></p>
+  ${setPasswordUrl ? `<p style="margin:20px 0"><a href="${esc(setPasswordUrl)}" style="display:inline-block;background:#1a1a1a;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600">Set your password</a></p><p style="font-size:12px;color:#6b665e">This link works once and expires soon. If it has, ask us for a new one.</p>` : ''}
   ${payUrl ? `<p style="margin:20px 0"><a href="${esc(payUrl)}" style="display:inline-block;background:#1a1a1a;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600">Renew now</a></p><p style="font-size:12px;color:#6b665e;word-break:break-all">${esc(payUrl)}</p>` : ''}
   ${kind === 'welcome' ? `<ol style="font-size:15px;line-height:1.6;padding-left:20px">${steps.map((s) => `<li>${esc(s)}</li>`).join('')}</ol>` : ''}
   ${footer ? `<p style="font-size:13px;color:#6b665e;line-height:1.5">${esc(footer)}</p>` : ''}
