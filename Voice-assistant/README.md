@@ -34,7 +34,12 @@ Then open `http://localhost:3000`. If you don't set `STAFF_PIN`, the server uses
 | `WHISPER_URL` | `http://127.0.0.1:8765` | Whisper service address |
 | `WHISPER_MODEL` | `small` | Whisper model the service loads. Multilingual models also understand Hindi and Marathi; `small.en` is English-only |
 | `WHISPER_AUTOSTART` | on | Set to `0` to stop `npm start` launching the Whisper service |
-| `PIPER_VOICE` | `en_US-amy-medium` | Assistant voice ([Piper voices](https://huggingface.co/rhasspy/piper-voices)); downloaded on first start |
+| `PIPER_VOICE` | `en_US-amy-medium` | Backup assistant voice ([Piper voices](https://huggingface.co/rhasspy/piper-voices)), used when Voicebox isn't running; downloaded on first start |
+| `VOICEBOX_PRESET` | `kokoro:af_heart` | Assistant voice in Voicebox, as `engine:voice`, for example `kokoro:af_bella` or `qwen_custom_voice:Serena` |
+| `VOICEBOX_SPEED` | `0.93` | Speaking pace, applied on the tablet with pitch kept. 0.93 is about 160 words a minute |
+| `VOICEBOX_VOICE` | `Restaurant host` | Name of the Voicebox voice profile, created on first start if missing |
+| `VOICEBOX_INSTRUCTIONS`, `VOICEBOX_MODEL_SIZE` | none, `0.6B` | Delivery instructions and model size, for Qwen voices only |
+| `VOICEBOX_URL`, `VOICEBOX_SERVER`, `VOICEBOX_AUTOSTART` | `http://127.0.0.1:17493`, see below, on | Where Voicebox answers, its program file, and `0` to stop `npm start` launching it. `VOICEBOX=off` turns Voicebox off |
 | `HTTPS_PORT`, `HTTPS` | `3443`, on | The secure port for tablets. `HTTPS=off` turns it off, but then tablets on the network have no microphone |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE` | unset | Use your own certificate (a real domain name) instead of the one created here |
 | `HOST` | all interfaces | Network interface to listen on. The root `npm run dev` sets `127.0.0.1`, because its proxy on port 3000 is the way in |
@@ -104,7 +109,15 @@ whisper-service/.venv/Scripts/python -m pip install torch --index-url https://do
 whisper-service/.venv/Scripts/python -m pip install -r whisper-service/requirements.txt
 ```
 
-(On macOS/Linux the interpreter is `whisper-service/.venv/bin/python`.) After that, `npm start` launches the Whisper service automatically; the first start downloads the model (~460 MB for `small`). `npm run whisper` runs it on its own. The assistant's spoken replies use Chrome's **Google UK English Female** voice at 1.12× speed, or 0.9× when the guest picks a slower voice (`VOICE_NAME` and `VOICE_RATE` in `customer-app/client/customer.jsx`), spoken a sentence at a time; Hindi and Marathi use the browser's hi-IN or mr-IN voice. Google's voices are synthesized online, so reply text (not guest audio) goes to Google. On browsers without it, another British female voice is used, then **Amy**, the local [Piper](https://github.com/OHF-Voice/piper1-gpl) voice from the Alice assistant, synthesized by the same service (`POST /api/tables/:t/speak`, cached, 30 replies per minute per table; the voice file, ~60 MB, downloads on first start). If Whisper isn't installed or stops responding, tablets fall back to the browser's built-in speech recognition and voice; if the VAD can't load, a simple loudness detector ends turns instead. The VAD's runtime files (`public/assets/vendor/ort`, `vad`, about 17 MB) are copied by `npm run build` and cached by tablets for a day.
+(On macOS/Linux the interpreter is `whisper-service/.venv/bin/python`.) After that, `npm start` launches the Whisper service automatically; the first start downloads the model (~460 MB for `small`). `npm run whisper` runs it on its own. In English, the assistant's spoken replies use the Voicebox voice described below. Without Voicebox, and in other languages, they use Chrome's **Google UK English Female** voice at 1.12× speed, or 0.9× when the guest picks a slower voice (`VOICE_NAME` and `VOICE_RATE` in `customer-app/client/customer.jsx`), spoken a sentence at a time; Hindi and Marathi use the browser's hi-IN or mr-IN voice. Google's voices are synthesized online, so reply text (not guest audio) goes to Google. On browsers without it, another British female voice is used, then **Amy**, the local [Piper](https://github.com/OHF-Voice/piper1-gpl) voice from the Alice assistant, synthesized by the same service (`POST /api/tables/:t/speak`, cached, 30 replies per minute per table; the voice file, ~60 MB, downloads on first start). If Whisper isn't installed or stops responding, tablets fall back to the browser's built-in speech recognition and voice; if the VAD can't load, a simple loudness detector ends turns instead. The VAD's runtime files (`public/assets/vendor/ort`, `vad`, about 17 MB) are copied by `npm run build` and cached by tablets for a day.
+
+## The assistant's voice with Voicebox
+
+The assistant answers in English with a female voice from [Voicebox](https://github.com/jamiepine/voicebox) (MIT), made on the restaurant's computer, so reply text never leaves it. The default is Kokoro's **Heart** voice (`hexgrad/Kokoro-82M`, Apache 2.0), played at 0.93× (about 160 words a minute). In English it takes priority over the browser's voices. Hindi, Marathi and other languages keep using the browser's voices. `server/voicebox.js` creates the voice profile on first start. It makes each reply through `POST /generate/stream`, which keeps no copy, and caches repeated lines. If Voicebox stops, replies fall back to Piper's Amy, then to the browser's voice.
+
+Measured on an RTX 4050 laptop GPU, a Kokoro reply takes about 0.3 to 0.4 seconds through the app. Qwen CustomVoice voices are more expressive, but took 33 to 39 seconds per reply on that GPU, so they are too slow for guests on similar hardware.
+
+One-time setup on Windows with an NVIDIA GPU: download `voicebox-server-cuda.tar.gz` and `cuda-libs-cu128-v1.tar.gz` from the [v0.5.0 release](https://github.com/jamiepine/voicebox/releases/tag/v0.5.0), check their `.sha256` files, and unpack both into `%LOCALAPPDATA%\voicebox-server\data\backends\cuda`, about 5 GB in total. Copy `cuda-libs.json` there too. `npm start` then launches `voicebox-server-cuda.exe` with that `data` folder and stops it on exit. Set `VOICEBOX_SERVER` if it lives elsewhere. The first start downloads the Kokoro model, about 330 MB, into the Hugging Face cache. Two endpoints the app could have used, the OpenAI-compatible `/v1/audio/speech` and Qwen VoiceDesign, exist only in Voicebox's unreleased code, not in 0.5.0.
 
 ## How it fits together
 
@@ -139,6 +152,7 @@ Two separate front-end apps share one backend:
 - `shared/menuparse.js`: reads an uploaded menu's text into sections and dishes (staff browser, tested in Node)
 - `server/health.js`: turns the licence status into the Health tab's card
 - `server/tls.js`: the local certificates behind HTTPS for tablets
+- `server/voicebox.js`: the assistant's voice from Voicebox, which is started, checked and stopped with the server
 - `server/`: the one HTTP server, SQLite store and assistant pipeline both apps talk to
 - `public/assets/`: the built JS/CSS output for both apps (generated by `npm run build`, not hand-edited)
 

@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { createStore } from './store.js';
 import { createAssistant } from './assistant.js';
 import { createWhisper } from './whisper.js';
+import { createVoicebox } from './voicebox.js';
 import { createLicense } from './license.js';
 import { createBackups } from './backup.js';
 import { validateCall, CATEGORIES, ALLERGEN_KEYS, UNDO_MS, RATE_LIMIT, CURRENCIES, setMenuMeta, fmt, hasSizes, sizeId } from '../shared/engine.js';
@@ -42,6 +43,7 @@ let currentRestaurant = null;
 const store = new Proxy({}, { get: (_, key) => current[key] });
 const assistant = createAssistant(store);
 const whisper = createWhisper(ROOT);
+const voicebox = createVoicebox();
 const transcribeStamps = new Map(); // table -> timestamps, caps GPU work per tablet
 const TRANSCRIBE_LIMIT = 12;
 const speakStamps = new Map(); // table -> timestamps for spoken replies
@@ -438,7 +440,8 @@ async function route(req, res) {
   if (method === 'GET' && p === '/api/voice') {
     const w = whisper.status();
     const set = tabletSettings();
-    const tts = w && w.voice ? { tts: 'piper', voice: w.voice } : { tts: 'browser' };
+    const vb = voicebox.status();
+    const tts = vb ? { tts: 'voicebox', voice: vb.voice, rate: vb.rate } :w && w.voice ? { tts: 'piper', voice: w.voice } : { tts: 'browser' };
     const common = { vad: set.vad, offlineOnly: set.voicePrivacy === 'offline', ...tts };
     return send(res, 200, w
       ? { engine: 'whisper', model: w.model, device: w.device, languages: w.languages || ['en'], ...common }
@@ -584,25 +587,30 @@ async function route(req, res) {
         store.addRequest(table, 'bill', `Bill ${fmt(total)}${split > 1 ? ` · split ${split} ways (${fmt(total / split)} each)` : ''}`, split);
       } else bad('Unknown request type.');
     } else if (method === 'POST' && sub === '/speak') {
-      // Alice's Piper voice, synthesized locally by the voice service; the tablet plays the WAV.
+      // The assistant's voice, made on this computer: Voicebox when it runs, else Piper. The tablet plays the WAV.
       const text = typeof body.text === 'string' ? body.text.trim().slice(0, 400) : '';
       if (!text) bad('Nothing to say.');
       const w = whisper.status();
-      // The local voice speaks English only; over the voice limit the tablet uses its own voice.
-      if (!w || !w.voice || (body.lang && body.lang !== 'en') || license.status().usage === 'throttled') return send(res, 503, { error: 'The assistant voice is offline.' });
+      const vb = voicebox.status();
+      const piper = !!(w && w.voice);
+      // The local voices speak English only; over the voice limit the tablet uses its own voice.
+      if ((!vb && !piper) || (body.lang && body.lang !== 'en') || license.status().usage === 'throttled') return send(res, 503, { error: 'The assistant voice is offline.' });
       const now = Date.now();
       const recent = (speakStamps.get(table) || []).filter((t) => now - t < 60000);
       if (recent.length >= SPEAK_LIMIT) return send(res, 429, { error: 'rate_limited' });
       if (!(await countVoice(req, res, 'speak'))) return;
       recent.push(now); speakStamps.set(table, recent);
-      try {
-        const wav = await whisper.speak(text, body.rate === 'slow' ? 'slow' : 'normal');
-        res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store', ...SECURITY_HEADERS });
-        return res.end(wav);
-      } catch (e) {
-        console.error('[piper]', e.message);
-        return send(res, 503, { error: 'The assistant voice is offline.' });
+      const rate = body.rate === 'slow' ? 'slow' : 'normal';
+      let wav = null;
+      if (vb) {
+        try { wav = await voicebox.speak(text); } catch (e) { console.error('[voicebox]', e.message); }
       }
+      if (!wav && piper) {
+        try { wav = await whisper.speak(text, rate); } catch (e) { console.error('[piper]', e.message); }
+      }
+      if (!wav) return send(res, 503, { error: 'The assistant voice is offline.' });
+      res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store', ...SECURITY_HEADERS });
+      return res.end(wav);
     } else if (method === 'POST' && sub === '/assistant') {
       const lang = isLang(body.lang) ? body.lang : 'en';
       const wait = slowLane(table, { ticket: true });
@@ -748,4 +756,5 @@ server.listen(PORT, process.env.HOST || undefined, () => {
   startHttps();
   backups.start();
   whisper.start();
+  voicebox.start();
 });

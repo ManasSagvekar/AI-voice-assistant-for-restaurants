@@ -19,7 +19,7 @@ let server;
 
 before(async () => {
   server = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'server/index.js'], {
-    env: { ...process.env, PORT: String(PORT), HTTPS_PORT: String(HTTPS_PORT), DB_FILE: path.join(directory, 'restaurant.db'), BACKUP_DIR: path.join(directory, 'b'), WHISPER_AUTOSTART: '0', SUPABASE_URL: '', SUPABASE_ANON_KEY: '', STAFF_PIN: PIN, HOST: '127.0.0.1', TABLE_COUNT: '8', HTTPS: '' },
+    env: { ...process.env, PORT: String(PORT), HTTPS_PORT: String(HTTPS_PORT), DB_FILE: path.join(directory, 'restaurant.db'), BACKUP_DIR: path.join(directory, 'b'), WHISPER_AUTOSTART: '0', VOICEBOX: 'off', SUPABASE_URL: '', SUPABASE_ANON_KEY: '', STAFF_PIN: PIN, HOST: '127.0.0.1', TABLE_COUNT: '8', HTTPS: '' },
   });
   let log = '';
   await new Promise((resolve, reject) => {

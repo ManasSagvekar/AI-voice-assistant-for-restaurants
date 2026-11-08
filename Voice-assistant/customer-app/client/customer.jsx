@@ -865,7 +865,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
   // 'whisper' when the restaurant's Whisper service is up, otherwise the browser's recognizer.
   const [engine, setEngine] = useState(voice.engine); const engineRef = useRef(voice.engine);
   useEffect(() => { engineRef.current = voice.engine; setEngine(voice.engine); }, [voice.engine]);
-  // 'piper' when the voice service has Alice's Amy voice loaded, otherwise the browser's own voice.
+  // voice.tts: 'voicebox' or 'piper' when this restaurant's computer makes the voice, otherwise 'browser'.
   const audioRef = useRef(null); const speechSeq = useRef(0); const captionTimer = useRef(null);
   const voiceReady = useRef(voicesLoaded);
   const [phase, setPhase] = useState('');
@@ -917,9 +917,9 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
     } catch (e) { /* no TTS available; say() has a timing fallback */ }
   }
 
-  // Alice's "Amy" voice (Piper), synthesized by the restaurant's voice service. Any failure falls
-  // back to the browser's voice so the guest still hears the reply.
-  async function piperSpeak(text, finish, seq) {
+  // The restaurant computer's voice (Voicebox, or Piper's "Amy"). Any failure falls back to the
+  // browser's voice so the guest still hears the reply.
+  async function localSpeak(text, finish, seq) {
     try {
       const res = await fetch(`/api/tables/${table}/speak`, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, rate: ctx.current.prefs.slow ? 'slow' : 'normal', lang: ctx.current.prefs.lang }) });
@@ -927,6 +927,8 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
       const url = URL.createObjectURL(await res.blob());
       if (seq !== speechSeq.current) { URL.revokeObjectURL(url); return; }
       const a = new Audio(url);
+      // Voicebox replies are paced here (pitch kept): the restaurant's speed, slower when the guest asks.
+      if (ctx.current.voice.tts === 'voicebox') { a.preservesPitch = true; a.playbackRate = (ctx.current.voice.rate || 1) * (ctx.current.prefs.slow ? 0.85 : 1); }
       audioRef.current = a;
       a.onended = a.onerror = () => { URL.revokeObjectURL(url); if (audioRef.current === a) audioRef.current = null; finish(); };
       await a.play();
@@ -938,11 +940,12 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
   // Resolves when the line has been spoken (or the timing fallback fires). Every line is also captioned.
   function say(text, force) {
     const { prefs: p, voice: v } = ctx.current;
-    // The British browser voice wins when present; Amy (Piper) is the next choice, in English.
-    const piper = p.lang === 'en' && !preferredVoice('en', v.offlineOnly) && v.tts === 'piper';
+    // In English, the Voicebox voice always wins. Piper's Amy comes after the British browser voice.
+    const local = p.lang === 'en' && (v.tts === 'voicebox' || (v.tts === 'piper' && !preferredVoice('en', v.offlineOnly)));
     const rate = p.slow ? VOICE_RATE.slow : VOICE_RATE.normal;
     // Fallback in case no end event arrives: generous, so listening never starts over the reply.
-    const est = piper ? Math.max(1400, text.length * (p.slow ? 95 : 75)) + 3000 : Math.max(1400, (text.length * 70) / rate) + 2000;
+    // Voicebox takes longer to make a reply than Piper, so it gets more room.
+    const est = local ? Math.max(1400, text.length * (p.slow ? 95 : 75)) + (v.tts === 'voicebox' ? 8000 : 3000) : Math.max(1400, (text.length * 70) / rate) + 2000;
     const turn = turnRef.current;
     if (!force) setState('speaking');
     clearTimeout(captionTimer.current);
@@ -956,7 +959,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
         resolve();
       };
       stopSpeech();
-      if (ctx.current.sound) (piper ? piperSpeak(text, finish, speechSeq.current) : browserSpeak(text, finish));
+      if (ctx.current.sound) (local ? localSpeak(text, finish, speechSeq.current) : browserSpeak(text, finish));
       later(finish, ctx.current.sound ? est : Math.min(7000, Math.max(1400, text.length * 52)));
     });
   }
@@ -1297,7 +1300,7 @@ const VoiceAssistant = React.forwardRef(function VoiceAssistant({ table, menu, u
   // What the guest is told about where their voice goes.
   const heardBy = engine === 'whisper' ? t.privacyLocal : voice.offlineOnly ? t.offlineNoMic : t.privacyBrowser;
   const ttsVoice = preferredVoice(prefs.lang, voice.offlineOnly);
-  const spokenBy = ttsVoice && !ttsVoice.localService ? t.voiceGoogle : t.voiceLocal;
+  const spokenBy = (voice.tts === 'voicebox' && prefs.lang === 'en') || !ttsVoice || ttsVoice.localService ? t.voiceLocal : t.voiceGoogle;
 
   return (
     <div className="glass rounded-3xl shadow-[0_18px_50px_-30px_rgba(60,40,10,0.45)] overflow-hidden">
